@@ -9,9 +9,9 @@
     ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚══════╝
 ```
 
-**v5.0.0** — 80 tools across four categories
+**v5.0.0** — 80+ tools across four categories
 
-ARGUS is a comprehensive terminal-based OSINT and security toolkit written in Python. It provides **80 tools** organized into four categories — reconnaissance, exploitation testing, stress testing, and phishing simulation — all accessible through an interactive two-column menu.
+ARGUS is a comprehensive terminal-based OSINT and security toolkit written in Python. It provides **80 tools** organized into four categories: reconnaissance, exploitation testing, stress testing, and phishing simulation, all accessible through an interactive two-column menu.
 
 ---
 
