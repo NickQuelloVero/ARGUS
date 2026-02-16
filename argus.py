@@ -10,6 +10,7 @@ import io
 import json
 import re
 import socket
+import ipaddress
 import struct
 import sys
 import time
@@ -60,6 +61,14 @@ try:
     import socks  # PySocks
 except ImportError:
     socks = None
+
+try:
+    import phonenumbers
+    from phonenumbers import geocoder as pn_geocoder
+    from phonenumbers import carrier as pn_carrier
+    from phonenumbers import timezone as pn_timezone
+except ImportError:
+    phonenumbers = None
 
 # ─── Color shortcuts ───────────────────────────────────────────────────────────
 
@@ -126,6 +135,50 @@ USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3; rv:124.0) Gecko/20100101 Firefox/124.0",
 ]
 
+ACCEPT_LANGUAGES = [
+    "en-US,en;q=0.9",
+    "en-GB,en;q=0.9",
+    "en-US,en;q=0.9,es;q=0.8",
+    "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+    "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
+    "es-ES,es;q=0.9,en;q=0.8",
+    "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
+    "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+    "ja;q=0.9,en-US;q=0.8,en;q=0.7",
+    "zh-CN,zh;q=0.9,en;q=0.8",
+]
+
+ACCEPT_HEADERS = [
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+]
+
+ACCEPT_ENCODINGS = [
+    "gzip, deflate, br",
+    "gzip, deflate",
+    "gzip, deflate, br, zstd",
+]
+
+
+def _random_stealth_headers():
+    """Generate a full set of randomized browser headers."""
+    return {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": random.choice(ACCEPT_HEADERS),
+        "Accept-Language": random.choice(ACCEPT_LANGUAGES),
+        "Accept-Encoding": random.choice(ACCEPT_ENCODINGS),
+        "DNT": "1",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Connection": "keep-alive",
+    }
+
+
 # ─── Stealth: Monkey-patch requests ──────────────────────────────────────────
 
 _orig_requests_get = requests.get
@@ -148,16 +201,48 @@ def _stealth_proxy_dict():
     return {"http": url, "https": url}
 
 
+_proxy_health = {"alive": False, "checked_at": 0.0}
+_PROXY_CHECK_INTERVAL = 10  # seconds between proxy health checks
+
+
+def _is_proxy_alive():
+    """Cached proxy health check — re-checks every _PROXY_CHECK_INTERVAL seconds."""
+    now = time.time()
+    if now - _proxy_health["checked_at"] < _PROXY_CHECK_INTERVAL:
+        return _proxy_health["alive"]
+    alive = _is_port_open(STEALTH["proxy_host"], STEALTH["proxy_port"])
+    _proxy_health["alive"] = alive
+    _proxy_health["checked_at"] = now
+    return alive
+
+
 def _stealth_request(orig_func, *args, **kwargs):
-    """Wrap a requests function to inject proxy and random UA when stealth is on."""
+    """Wrap a requests function to inject proxy and random UA when stealth is on.
+    Includes a kill-switch: if stealth is active but the proxy is unreachable,
+    the request FAILS instead of silently falling back to a direct connection."""
     if STEALTH["enabled"]:
+        # --- Kill-switch: verify proxy is reachable ---
+        if STEALTH["proxy_type"] in ("tor", "socks5") and socks is None:
+            raise ConnectionError(
+                "[STEALTH] PySocks is not installed — cannot route through "
+                f"{STEALTH['proxy_type'].upper()}.  Install with: pip install PySocks"
+            )
+        if not _is_proxy_alive():
+            raise ConnectionError(
+                f"[STEALTH] Proxy {STEALTH['proxy_host']}:{STEALTH['proxy_port']} "
+                f"is unreachable — request blocked to prevent IP leak."
+            )
+        # --- Inject proxy ---
         if "proxies" not in kwargs:
             kwargs["proxies"] = _stealth_proxy_dict()
+        # --- Inject full randomized browser headers (anti-fingerprint) ---
         if STEALTH["rotate_ua"]:
-            headers = kwargs.get("headers") or {}
-            if "User-Agent" not in headers:
-                headers["User-Agent"] = random.choice(USER_AGENTS)
-                kwargs["headers"] = headers
+            stealth_hdrs = _random_stealth_headers()
+            existing = kwargs.get("headers") or {}
+            # Only inject headers the caller didn't set explicitly
+            for k, v in stealth_hdrs.items():
+                existing.setdefault(k, v)
+            kwargs["headers"] = existing
     return orig_func(*args, **kwargs)
 
 
@@ -178,14 +263,28 @@ class StealthSession(_OrigSession):
         if STEALTH["enabled"]:
             self.proxies.update(_stealth_proxy_dict())
             if STEALTH["rotate_ua"]:
-                self.headers["User-Agent"] = random.choice(USER_AGENTS)
+                self.headers.update(_random_stealth_headers())
 
     def request(self, method, url, **kwargs):
         if STEALTH["enabled"]:
-            if "proxies" not in kwargs and not self.proxies:
-                kwargs["proxies"] = _stealth_proxy_dict()
-            if STEALTH["rotate_ua"] and "User-Agent" not in self.headers:
-                self.headers["User-Agent"] = random.choice(USER_AGENTS)
+            # Kill-switch: same checks as _stealth_request
+            if STEALTH["proxy_type"] in ("tor", "socks5") and socks is None:
+                raise ConnectionError(
+                    "[STEALTH] PySocks not installed — request blocked."
+                )
+            if not _is_proxy_alive():
+                raise ConnectionError(
+                    f"[STEALTH] Proxy unreachable — request blocked."
+                )
+            # Always inject fresh proxy (settings may have changed)
+            proxy_dict = _stealth_proxy_dict()
+            if "proxies" not in kwargs:
+                kwargs["proxies"] = proxy_dict
+            self.proxies.update(proxy_dict)
+            if STEALTH["rotate_ua"]:
+                stealth_hdrs = _random_stealth_headers()
+                for k, v in stealth_hdrs.items():
+                    self.headers.setdefault(k, v)
         return super().request(method, url, **kwargs)
 
 
@@ -197,8 +296,11 @@ _orig_socket = socket.socket
 
 
 def _activate_socket_proxy():
-    """Replace socket.socket with a SOCKS-aware version for TCP connections."""
+    """Replace socket.socket with a SOCKS-aware version for TCP connections.
+    NEVER silently falls back to a direct connection — blocks instead."""
     if socks is None:
+        print(f"  {R}[!] PySocks not installed — socket-level proxying disabled.{RST}")
+        print(f"  {R}    Install with: pip install PySocks{RST}")
         return
     s = STEALTH
     if s["proxy_type"] in ("tor", "socks5"):
@@ -207,34 +309,36 @@ def _activate_socket_proxy():
         ptype = socks.HTTP
     phost = s["proxy_host"]
     pport = s["proxy_port"]
-    rdns = True  # resolve DNS through proxy (prevent DNS leak)
 
     class _SmartSocksSocket(_orig_socket):
-        """Proxy TCP (SOCK_STREAM) through SOCKS; let RAW/DGRAM pass through."""
+        """Proxy TCP (SOCK_STREAM) through SOCKS; let RAW/DGRAM pass through
+        only with explicit user consent.  NEVER silently falls back.
+        Blocks AF_INET6 to prevent IPv6 leaks that bypass SOCKS/Tor."""
 
         def __init__(self, family=socket.AF_INET, type=socket.SOCK_STREAM,
                      proto=0, fileno=None):
+            # Force IPv4: IPv6 bypasses SOCKS/Tor entirely
+            if family == socket.AF_INET6:
+                family = socket.AF_INET
             super().__init__(family, type, proto, fileno)
-            if type == socket.SOCK_STREAM and socks is not None:
-                try:
-                    socks.setdefaultproxy(ptype, phost, pport, rdns)
-                    # We use the socksocket connect later
-                    self._stealth_proxy = (ptype, phost, pport, rdns)
-                except Exception:
-                    self._stealth_proxy = None
+            if type == socket.SOCK_STREAM:
+                self._stealth_proxy = (ptype, phost, pport, True)
             else:
                 self._stealth_proxy = None
 
         def connect(self, address):
-            if self._stealth_proxy and hasattr(socks, 'socksocket'):
-                # Create a socks socket and steal its connection
+            if self._stealth_proxy:
+                # Route TCP through SOCKS — if this fails the exception
+                # propagates up, which is INTENTIONAL (no silent fallback).
                 ss = socks.socksocket(self.family, self.type, self.proto)
-                ss.setproxy(ptype, phost, pport, rdns)
+                ss.setproxy(*self._stealth_proxy)
+                ss.settimeout(self.gettimeout())
                 ss.connect(address)
-                # Copy the file descriptor
                 os.dup2(ss.fileno(), self.fileno())
                 ss.detach()
                 return
+            # RAW/UDP sockets: user was already warned by
+            # _stealth_raw_socket_warning() before reaching here.
             super().connect(address)
 
     socket.socket = _SmartSocksSocket
@@ -244,19 +348,78 @@ def _deactivate_socket_proxy():
     """Restore the original socket.socket."""
     socket.socket = _orig_socket
 
-# ─── Stealth: DNS leak warning ───────────────────────────────────────────────
+# ─── Stealth: DNS leak prevention ────────────────────────────────────────────
+# Block gethostbyname AND getaddrinfo when stealth is active.
+# Proxied connections (requests with socks5h://, PySocks socksocket) resolve
+# DNS remotely through the proxy and never call these functions for the
+# target hostname, so blocking them only catches *unproxied* lookups that
+# would leak the real IP.
 
 _orig_gethostbyname = socket.gethostbyname
+_orig_getaddrinfo = socket.getaddrinfo
+
+_LOCALHOST_NAMES = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
 
 
-def _warn_dns_leak(hostname):
-    """Warn when DNS resolution happens outside the proxy."""
-    if STEALTH["enabled"]:
-        print(f"  {Y}[!] DNS lookup for '{hostname}' outside proxy (potential leak){RST}")
+def _is_local_or_ip(host):
+    """Return True if *host* is an IP literal or a localhost alias."""
+    host_str = str(host)
+    if host_str in _LOCALHOST_NAMES:
+        return True
+    try:
+        ipaddress.ip_address(host_str)
+        return True          # already an IP — no DNS needed
+    except ValueError:
+        return False
+
+
+def _block_dns_leak(hostname):
+    """Block local DNS resolution when stealth is active (prevents IP leak)."""
+    if STEALTH["enabled"] and not _is_local_or_ip(hostname):
+        raise OSError(
+            f"[STEALTH] DNS lookup for '{hostname}' blocked — "
+            f"would expose your real IP.  Use proxied connections."
+        )
     return _orig_gethostbyname(hostname)
 
 
-socket.gethostbyname = _warn_dns_leak
+def _block_getaddrinfo_leak(host, port, family=0, type=0, proto=0, flags=0):
+    """Block getaddrinfo when stealth is active (prevents IP leak).
+    Also forces AF_INET (IPv4) to prevent IPv6 leaks — Tor/SOCKS
+    typically don't support IPv6 and it would bypass the proxy."""
+    if STEALTH["enabled"]:
+        if not _is_local_or_ip(host):
+            raise OSError(
+                f"[STEALTH] DNS lookup for '{host}' blocked — "
+                f"would expose your real IP.  Use proxied connections."
+            )
+        # Force IPv4: IPv6 bypasses SOCKS/Tor entirely
+        if family == 0 or family == socket.AF_INET6:
+            family = socket.AF_INET
+    return _orig_getaddrinfo(host, port, family, type, proto, flags)
+
+
+socket.gethostbyname = _block_dns_leak
+socket.getaddrinfo = _block_getaddrinfo_leak
+
+# ─── Stealth: Force dns.resolver to use TCP (goes through SOCKS) ────────────
+# UDP DNS queries bypass the SOCKS proxy and leak your real IP.
+# By forcing TCP mode, dns.resolver queries are routed through the
+# monkey-patched socket → SOCKS → Tor, so the DNS server sees the
+# exit-node IP, not yours.
+
+if dns is not None:
+    try:
+        _orig_dns_resolver_resolve = dns.resolver.Resolver.resolve
+
+        def _stealth_dns_resolve(self, *args, **kwargs):
+            if STEALTH["enabled"]:
+                kwargs.setdefault("tcp", True)
+            return _orig_dns_resolver_resolve(self, *args, **kwargs)
+
+        dns.resolver.Resolver.resolve = _stealth_dns_resolve
+    except AttributeError:
+        pass  # older dnspython without .resolve()
 
 # ─── Stealth: Raw socket bypass warning ─────────────────────────────────────
 
@@ -273,15 +436,202 @@ def _stealth_raw_socket_warning(func_name):
     return ans == "y"
 
 
+# ─── Stealth: MAC address spoofing ───────────────────────────────────────────
+
+_ORIGINAL_MAC = {"iface": None, "mac": None}
+
+
+def _get_active_interface():
+    """Detect the primary network interface (the one with the default route)."""
+    try:
+        result = subprocess.check_output(
+            ["ip", "route", "show", "default"],
+            text=True, timeout=5
+        ).strip()
+        parts = result.split()
+        if "dev" in parts:
+            return parts[parts.index("dev") + 1]
+    except Exception:
+        pass
+    return None
+
+
+def _get_current_mac(iface):
+    """Read the current MAC address of *iface*."""
+    try:
+        result = subprocess.check_output(
+            ["ip", "link", "show", iface], text=True, timeout=5
+        )
+        for line in result.split("\n"):
+            if "link/ether" in line:
+                return line.strip().split()[1]
+    except Exception:
+        pass
+    return None
+
+
+def _generate_random_mac():
+    """Generate a random unicast, locally-administered MAC address."""
+    first = random.randint(0, 255) & 0xFE | 0x02   # LAA + unicast
+    rest = [random.randint(0, 255) for _ in range(5)]
+    return ":".join(f"{b:02x}" for b in [first] + rest)
+
+
+def _spoof_mac():
+    """Spoof the MAC of the active interface.  Requires sudo."""
+    iface = _get_active_interface()
+    if not iface:
+        print(f"  {R}[!] Could not detect active network interface.{RST}")
+        return False
+
+    current = _get_current_mac(iface)
+    if not current:
+        print(f"  {R}[!] Could not read MAC for {iface}.{RST}")
+        return False
+
+    # Save original only once
+    if _ORIGINAL_MAC["mac"] is None:
+        _ORIGINAL_MAC["iface"] = iface
+        _ORIGINAL_MAC["mac"] = current
+
+    new_mac = _generate_random_mac()
+    print(f"  {C}[*] Spoofing MAC on {iface}: {current} -> {new_mac}{RST}")
+    try:
+        subprocess.check_call(
+            ["sudo", "ip", "link", "set", iface, "down"], timeout=10)
+        subprocess.check_call(
+            ["sudo", "ip", "link", "set", iface, "address", new_mac], timeout=10)
+        subprocess.check_call(
+            ["sudo", "ip", "link", "set", iface, "up"], timeout=10)
+        print(f"  {G}[+] MAC spoofed: {W}{current}{G} -> {W}{new_mac}{G} ({iface}){RST}")
+        return True
+    except Exception as e:
+        print(f"  {R}[!] MAC spoofing failed: {e}{RST}")
+        try:
+            subprocess.check_call(
+                ["sudo", "ip", "link", "set", iface, "up"], timeout=10)
+        except Exception:
+            pass
+        return False
+
+
+def _restore_mac():
+    """Restore the original MAC address saved by _spoof_mac()."""
+    if not _ORIGINAL_MAC["mac"] or not _ORIGINAL_MAC["iface"]:
+        print(f"  {Y}[*] No original MAC to restore (was not spoofed).{RST}")
+        return
+    iface = _ORIGINAL_MAC["iface"]
+    original = _ORIGINAL_MAC["mac"]
+    print(f"  {C}[*] Restoring original MAC on {iface}...{RST}")
+    try:
+        subprocess.check_call(
+            ["sudo", "ip", "link", "set", iface, "down"], timeout=10)
+        subprocess.check_call(
+            ["sudo", "ip", "link", "set", iface, "address", original], timeout=10)
+        subprocess.check_call(
+            ["sudo", "ip", "link", "set", iface, "up"], timeout=10)
+        print(f"  {G}[+] MAC restored: {W}{original}{G} ({iface}){RST}")
+        _ORIGINAL_MAC["mac"] = None
+        _ORIGINAL_MAC["iface"] = None
+    except Exception as e:
+        print(f"  {R}[!] MAC restore failed: {e}{RST}")
+
+
+# ─── Stealth: Tor circuit rotation ──────────────────────────────────────────
+
+def _tor_new_identity():
+    """Send SIGNAL NEWNYM to Tor's ControlPort to get a fresh circuit.
+    Requires ControlPort 9051 enabled in /etc/tor/torrc."""
+    try:
+        s = _orig_socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(5)
+        s.connect(("127.0.0.1", 9051))
+
+        # Try empty-password auth first, then cookie
+        s.send(b'AUTHENTICATE ""\r\n')
+        resp = s.recv(256)
+        if b"250" not in resp:
+            s.send(b"AUTHENTICATE\r\n")
+            resp = s.recv(256)
+
+        if b"250" not in resp:
+            s.close()
+            print(f"  {R}[!] Tor ControlPort auth failed.{RST}")
+            print(f"  {W}    Add to /etc/tor/torrc:{RST}")
+            print(f"  {W}      ControlPort 9051{RST}")
+            print(f"  {W}      CookieAuthentication 1{RST}")
+            print(f"  {W}    Then: sudo systemctl restart tor{RST}")
+            return False
+
+        s.send(b"SIGNAL NEWNYM\r\n")
+        resp = s.recv(256)
+        s.close()
+
+        if b"250" in resp:
+            print(f"  {G}[+] New Tor identity requested.{RST}")
+            print(f"  {C}[*] Waiting 5s for new circuit...{RST}")
+            time.sleep(5)
+            # Show new exit IP
+            try:
+                r = _orig_requests_get(
+                    "https://api.ipify.org?format=json",
+                    proxies=_stealth_proxy_dict(),
+                    headers={"User-Agent": random.choice(USER_AGENTS)},
+                    timeout=20,
+                )
+                new_ip = r.json().get("ip", "unknown")
+                print(f"  {G}[+] New exit IP: {W}{new_ip}{RST}")
+            except Exception:
+                pass
+            return True
+        else:
+            print(f"  {R}[!] NEWNYM failed: {resp.decode(errors='ignore').strip()}{RST}")
+            return False
+    except Exception as e:
+        print(f"  {R}[!] Cannot connect to Tor ControlPort (9051): {e}{RST}")
+        print(f"  {W}    Add to /etc/tor/torrc:{RST}")
+        print(f"  {W}      ControlPort 9051{RST}")
+        print(f"  {W}      CookieAuthentication 1{RST}")
+        print(f"  {W}    Then: sudo systemctl restart tor{RST}")
+        return False
+
+
+# ─── Stealth: auto-verify IP after activation ───────────────────────────────
+
+def _auto_verify_stealth():
+    """Automatically verify that the proxy is working after stealth activation.
+    If the check fails, offer to disable stealth to prevent accidental leaks."""
+    print(f"  {C}[*] Verifying anonymity...{RST}")
+    try:
+        r = _orig_requests_get(
+            "https://api.ipify.org?format=json",
+            proxies=_stealth_proxy_dict(),
+            headers={"User-Agent": random.choice(USER_AGENTS)},
+            timeout=20,
+        )
+        exit_ip = r.json().get("ip", "unknown")
+        print(f"  {G}[+] Identity masked — external IP: {W}{exit_ip}{RST}")
+    except Exception as e:
+        print(f"  {R}[!] VERIFICATION FAILED: {e}{RST}")
+        print(f"  {R}    The proxy may not be working — your real IP could leak!{RST}")
+        ans = input(f"  {Y}    Disable stealth for safety? (Y/n):{RST} ").strip().lower()
+        if ans != "n":
+            STEALTH["enabled"] = False
+            _deactivate_socket_proxy()
+            print(f"  {Y}[*] Stealth disabled — fix the proxy and try again.{RST}")
+
+
 # ─── Stealth: configure_stealth() ───────────────────────────────────────────
 def _is_port_open(host, port):
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    """Check if a local port is open using the ORIGINAL (unpatched) socket,
+    so the check works even when _SmartSocksSocket is active."""
+    s = _orig_socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(1)
     try:
         s.connect((host, port))
         s.close()
         return True
-    except:
+    except Exception:
         return False
 
 # Helper: Attempt to start Tor using sudo
@@ -327,12 +677,16 @@ def configure_stealth():
         print(f"\n{SEPARATOR}")
         print(f"  {Y}► {W}Stealth Mode Configuration  [{status}]{RST}")
         print(SEPARATOR)
+        mac_status = (f"{G}SPOOFED{RST}" if _ORIGINAL_MAC["mac"] else f"{W}Original{RST}")
         print(f"  {C}1.{RST} {W}Enable via Tor (socks5h://127.0.0.1:9050){RST}")
         print(f"  {C}2.{RST} {W}Enable via custom SOCKS5 proxy{RST}")
         print(f"  {C}3.{RST} {W}Enable via custom HTTP proxy{RST}")
         print(f"  {C}4.{RST} {W}Disable Stealth Mode{RST}")
         print(f"  {C}5.{RST} {W}Test connection (check IP via Tor Project){RST}")
         print(f"  {C}6.{RST} {W}Show current external IP{RST}")
+        print(f"  {C}7.{RST} {W}Spoof MAC address  [{mac_status}]{RST}")
+        print(f"  {C}8.{RST} {W}Restore original MAC{RST}")
+        print(f"  {C}9.{RST} {W}New Tor identity (rotate circuit){RST}")
         print(f"  {R}0.{RST} {W}Back to main menu{RST}")
         print(SEPARATOR)
 
@@ -360,7 +714,8 @@ def configure_stealth():
             STEALTH["proxy_port"] = 9050
             _activate_socket_proxy()
             print(f"  {G}[+] Stealth enabled via Tor (socks5h://127.0.0.1:9050){RST}")
-            
+            _auto_verify_stealth()
+
         elif choice == "2":
             if socks is None:
                 print(f"  {R}[!] PySocks not installed. Run: pip install PySocks{RST}")
@@ -378,6 +733,7 @@ def configure_stealth():
             STEALTH["proxy_port"] = port
             _activate_socket_proxy()
             print(f"  {G}[+] Stealth enabled via SOCKS5 ({host}:{port}){RST}")
+            _auto_verify_stealth()
         elif choice == "3":
             host = input(f"  {Y}HTTP proxy host [127.0.0.1]:{RST} ").strip() or "127.0.0.1"
             port = input(f"  {Y}HTTP proxy port [8080]:{RST} ").strip() or "8080"
@@ -392,9 +748,13 @@ def configure_stealth():
             STEALTH["proxy_port"] = port
             _activate_socket_proxy()
             print(f"  {G}[+] Stealth enabled via HTTP proxy ({host}:{port}){RST}")
+            _auto_verify_stealth()
         elif choice == "4":
             STEALTH["enabled"] = False
             _deactivate_socket_proxy()
+            _proxy_health["checked_at"] = 0.0   # reset health cache
+            if _ORIGINAL_MAC["mac"]:
+                _restore_mac()
             print(f"  {Y}[*] Stealth mode disabled{RST}")
         elif choice == "5":
             print(f"  {C}[*] Testing connection...{RST}")
@@ -418,6 +778,15 @@ def configure_stealth():
                 print(f"  {W}External IP: {G}{ip}{RST}")
             except Exception as e:
                 print(f"  {R}[!] Failed to get IP: {e}{RST}")
+        elif choice == "7":
+            _spoof_mac()
+        elif choice == "8":
+            _restore_mac()
+        elif choice == "9":
+            if not STEALTH["enabled"] or STEALTH["proxy_type"] != "tor":
+                print(f"  {Y}[!] Tor must be active (option 1) to rotate circuits.{RST}")
+            else:
+                _tor_new_identity()
         else:
             print(f"  {R}[!] Invalid option{RST}")
 # ─── Utility helpers ───────────────────────────────────────────────────────────
@@ -575,59 +944,134 @@ def email_lookup():
 
 # ─── 3. Phone Number Lookup ───────────────────────────────────────────────────
 
+_NUMBER_TYPE_NAMES = {
+    0: "Fixed line",
+    1: "Mobile",
+    2: "Fixed line or mobile",
+    3: "Toll free",
+    4: "Premium rate",
+    5: "Shared cost",
+    6: "VoIP",
+    7: "Personal number",
+    8: "Pager",
+    9: "UAN",
+    10: "Voicemail",
+    27: "Emergency",
+    28: "Short code",
+    29: "Standard rate",
+    99: "Unknown",
+}
+
+_COUNTRY_PREFIXES = {
+    "+1": "United States / Canada", "+7": "Russia / Kazakhstan",
+    "+20": "Egypt", "+27": "South Africa", "+30": "Greece",
+    "+31": "Netherlands", "+32": "Belgium", "+33": "France",
+    "+34": "Spain", "+36": "Hungary", "+39": "Italy",
+    "+40": "Romania", "+41": "Switzerland", "+43": "Austria",
+    "+44": "United Kingdom", "+45": "Denmark", "+46": "Sweden",
+    "+47": "Norway", "+48": "Poland", "+49": "Germany",
+    "+51": "Peru", "+52": "Mexico", "+53": "Cuba",
+    "+54": "Argentina", "+55": "Brazil", "+56": "Chile",
+    "+57": "Colombia", "+58": "Venezuela",
+    "+60": "Malaysia", "+61": "Australia", "+62": "Indonesia",
+    "+63": "Philippines", "+64": "New Zealand", "+65": "Singapore",
+    "+66": "Thailand", "+81": "Japan", "+82": "South Korea",
+    "+84": "Vietnam", "+86": "China", "+90": "Turkey",
+    "+91": "India", "+92": "Pakistan", "+93": "Afghanistan",
+    "+94": "Sri Lanka", "+95": "Myanmar",
+    "+212": "Morocco", "+213": "Algeria", "+216": "Tunisia",
+    "+218": "Libya", "+220": "Gambia", "+221": "Senegal",
+    "+234": "Nigeria", "+254": "Kenya", "+255": "Tanzania",
+    "+256": "Uganda", "+260": "Zambia", "+263": "Zimbabwe",
+    "+351": "Portugal", "+352": "Luxembourg", "+353": "Ireland",
+    "+354": "Iceland", "+355": "Albania", "+358": "Finland",
+    "+370": "Lithuania", "+371": "Latvia", "+372": "Estonia",
+    "+380": "Ukraine", "+381": "Serbia", "+385": "Croatia",
+    "+386": "Slovenia", "+420": "Czech Republic", "+421": "Slovakia",
+    "+852": "Hong Kong", "+853": "Macau", "+855": "Cambodia",
+    "+880": "Bangladesh", "+886": "Taiwan",
+    "+960": "Maldives", "+961": "Lebanon", "+962": "Jordan",
+    "+963": "Syria", "+964": "Iraq", "+965": "Kuwait",
+    "+966": "Saudi Arabia", "+967": "Yemen", "+968": "Oman",
+    "+971": "United Arab Emirates", "+972": "Israel", "+973": "Bahrain",
+    "+974": "Qatar", "+975": "Bhutan", "+976": "Mongolia",
+    "+977": "Nepal", "+992": "Tajikistan", "+993": "Turkmenistan",
+    "+994": "Azerbaijan", "+995": "Georgia", "+998": "Uzbekistan",
+}
+
+
 def phone_lookup():
     print_header("Phone Number Lookup")
-    phone = prompt("Phone number (with country code, e.g. +1234567890)")
+    phone = prompt("Phone number (with country code, e.g. +39 320 1234567)")
     if not phone:
         return
 
-    spinner("Looking up phone number...", 0.8)
-    try:
-        resp = requests.get(
-            f"http://apilayer.net/api/validate?access_key=demo&number={phone}",
-            timeout=8,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("valid"):
-                print_row("Valid", str(data.get("valid", "N/A")))
-                print_row("Country", data.get("country_name", "N/A"))
-                print_row("Location", data.get("location", "N/A"))
-                print_row("Carrier", data.get("carrier", "N/A"))
-                print_row("Line Type", data.get("line_type", "N/A"))
-            else:
-                print_warn("Number could not be validated via API")
-                print_warn("Performing basic analysis instead...")
-        else:
-            raise Exception("API unavailable")
-    except Exception:
-        # Fallback basic analysis
+    spinner("Analyzing phone number...", 0.8)
+
+    # --- Primary: phonenumbers library (offline, comprehensive) ---
+    if phonenumbers is not None:
+        try:
+            parsed = phonenumbers.parse(phone, None)
+        except phonenumbers.NumberParseException:
+            # Retry assuming Italian number if no country code
+            try:
+                parsed = phonenumbers.parse(phone, "IT")
+            except phonenumbers.NumberParseException as e:
+                print_err(f"Cannot parse number: {e}")
+                pause()
+                return
+
+        valid = phonenumbers.is_valid_number(parsed)
+        possible = phonenumbers.is_possible_number(parsed)
+        international = phonenumbers.format_number(
+            parsed, phonenumbers.PhoneNumberFormat.INTERNATIONAL)
+        national = phonenumbers.format_number(
+            parsed, phonenumbers.PhoneNumberFormat.NATIONAL)
+        e164 = phonenumbers.format_number(
+            parsed, phonenumbers.PhoneNumberFormat.E164)
+
+        country = pn_geocoder.description_for_number(parsed, "en") or "N/A"
+        region = phonenumbers.region_code_for_number(parsed) or "N/A"
+        carrier_name = pn_carrier.name_for_number(parsed, "en") or "N/A"
+        tz_list = pn_timezone.time_zones_for_number(parsed)
+        timezones = ", ".join(tz_list) if tz_list else "N/A"
+        num_type = phonenumbers.number_type(parsed)
+        type_name = _NUMBER_TYPE_NAMES.get(num_type, "Unknown")
+
+        print_row("International", international)
+        print_row("National", national)
+        print_row("E.164", e164)
+        print_row("Valid", f"{G}Yes{RST}" if valid else f"{R}No{RST}")
+        print_row("Possible", f"{G}Yes{RST}" if possible else f"{R}No{RST}")
+        print_row("Country", f"{country} ({region})")
+        print_row("Carrier", carrier_name)
+        print_row("Line Type", type_name)
+        print_row("Timezone(s)", timezones)
+        print_row("Country Code", f"+{parsed.country_code}")
+        print_row("National Number", str(parsed.national_number))
+
+        if not valid:
+            print_warn("Number did not pass full validation")
+
+    # --- Fallback: prefix-based analysis ---
+    else:
+        print_warn("'phonenumbers' not installed. Using basic prefix analysis.")
+        print_warn("Install for full results: pip install phonenumbers")
+        print()
         cleaned = re.sub(r"[^\d+]", "", phone)
         print_row("Cleaned Number", cleaned)
-        country_prefixes = {
-            "+1": "United States / Canada",
-            "+44": "United Kingdom",
-            "+39": "Italy",
-            "+49": "Germany",
-            "+33": "France",
-            "+34": "Spain",
-            "+81": "Japan",
-            "+86": "China",
-            "+91": "India",
-            "+61": "Australia",
-            "+55": "Brazil",
-            "+7": "Russia",
-            "+82": "South Korea",
-            "+52": "Mexico",
-            "+31": "Netherlands",
-        }
+        print_row("Digits", str(len(re.sub(r"\D", "", cleaned))))
+
         detected = "Unknown"
-        for prefix, country in sorted(country_prefixes.items(), key=lambda x: -len(x[0])):
+        for prefix, name in sorted(
+            _COUNTRY_PREFIXES.items(), key=lambda x: -len(x[0])
+        ):
             if cleaned.startswith(prefix):
-                detected = country
+                detected = name
                 break
         print_row("Country (guess)", detected)
-        print_row("Digits", str(len(re.sub(r"\D", "", cleaned))))
+
+    pause()
 
 
 # ─── 4. IP Address Lookup ─────────────────────────────────────────────────────
