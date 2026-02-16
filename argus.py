@@ -4,6 +4,7 @@ ARGUS - All-seeing Recon & General Unified Security
 A comprehensive terminal-based OSINT (Open Source Intelligence) tool.
 """
 
+import os
 import hashlib
 import io
 import json
@@ -6705,6 +6706,7 @@ def show_menu():
 
 
 def main():
+    os.system("clear")
     print(BANNER)
 
     while True:
