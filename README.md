@@ -11,7 +11,7 @@
 
 **v5.0.0** — 80+ tools across four categories
 
-ARGUS is a comprehensive terminal-based OSINT and security toolkit written in Python. It provides **80 tools** organized into four categories: reconnaissance, exploitation testing, stress testing, and phishing simulation, all accessible through an interactive two-column menu.
+ARGUS is a comprehensive terminal-based OSINT and security toolkit written in Python. It provides **80 tools** organized into four categories — reconnaissance, exploitation testing, stress testing, and phishing simulation — all accessible through an interactive two-column menu. It also features a built-in **Stealth Mode** that routes all traffic through Tor or custom proxies to protect your identity during operations.
 
 ---
 
@@ -21,11 +21,13 @@ ARGUS is a comprehensive terminal-based OSINT and security toolkit written in Py
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Usage](#usage)
+- [Stealth Mode](#stealth-mode)
 - [Tools](#tools)
   - [OSINT and Reconnaissance (40)](#osint-and-reconnaissance)
   - [Exploitation Testing (20)](#exploitation-testing)
   - [Stress Testing (10)](#stress-testing)
   - [Phishing Simulation (10)](#phishing-simulation)
+- [Authorization System](#authorization-system)
 - [Dependencies](#dependencies)
 - [License](#license)
 
@@ -79,6 +81,49 @@ python3 argus.py
 ```
 
 An interactive two-column menu will appear with all 80 tools organized by category. Enter the number corresponding to the tool you want to use and follow the on-screen prompts. Press `0` to exit. You can interrupt any running operation with `Ctrl+C`.
+
+The menu is color-coded by category:
+
+- **Cyan** — OSINT / Reconnaissance
+- **Red** — Exploitation and Stress Testing
+- **Magenta** — Phishing Simulation
+
+---
+
+## Stealth Mode
+
+ARGUS includes a built-in **Stealth Mode** that anonymizes all network traffic. Access it by pressing `S` from the main menu.
+
+### Features
+
+- **Proxy routing** — all HTTP/HTTPS requests and TCP socket connections are transparently routed through the configured proxy. No per-tool configuration needed.
+- **User-Agent rotation** — every request gets a random User-Agent from a pool of 15+ realistic browser strings.
+- **DNS leak prevention** — DNS resolution is performed through the proxy to avoid leaking queries to your local resolver.
+- **Socket-level integration** — monkey-patches Python's `socket.socket` and `requests` library so every tool benefits automatically.
+- **Real-time status** — the main menu header shows the current stealth state (ON/OFF), proxy type, and proxy address.
+
+### Stealth Menu Options
+
+| Option | Description |
+|--------|-------------|
+| 1 | Enable via **Tor** (connects to `127.0.0.1:9050`, auto-detects running Tor service) |
+| 2 | Enable via a **custom SOCKS5 proxy** |
+| 3 | Enable via a **custom HTTP proxy** |
+| 4 | **Disable** Stealth Mode |
+| 5 | **Test connection** (verifies Tor connectivity via the Tor Project API) |
+| 6 | **Show current external IP** (via ipify.org) |
+| 0 | Back to main menu |
+
+### Supported Proxy Types
+
+- **Tor** (SOCKS5 on port 9050) — requires a running Tor service
+- **SOCKS5** — any SOCKS5 proxy
+- **HTTP** — any HTTP proxy
+
+### Warnings
+
+- Tools using raw UDP or ICMP sockets (e.g., UDP Flood, ICMP Ping Flood) **cannot be proxied** and will display a bypass warning.
+- DNS queries that fall outside the proxy tunnel will trigger a DNS leak warning.
 
 ---
 
@@ -194,6 +239,41 @@ An interactive two-column menu will appear with all 80 tools organized by catego
 
 ---
 
+## Authorization System
+
+ARGUS enforces a three-tier authorization model based on tool category:
+
+| Category | Tools | Authorization |
+|----------|-------|---------------|
+| OSINT / Reconnaissance | 1–40 | None required — runs immediately. |
+| Exploitation Testing | 41–60 | Single confirmation — you must confirm you have authorization to test the target. |
+| Stress Testing | 61–70 | Double confirmation — confirm authorization **and** type `I ACCEPT ALL RESPONSIBILITY`. |
+| Phishing Simulation | 71–80 | Double confirmation — confirm authorization **and** type `I ACCEPT ALL RESPONSIBILITY`. |
+
+---
+
+## Built-in Payloads and Wordlists
+
+ARGUS ships with extensive built-in payload databases so no external wordlist files are needed:
+
+- 20 SQL injection payloads (union, blind, time-based, error-based)
+- 18 XSS payload vectors
+- 67 common directories and files
+- 15 open redirect payloads
+- 20 LFI / path traversal payloads
+- ~130 subdomain names for brute-forcing
+- 10 CRLF injection payloads
+- 20 SSRF payloads (localhost, cloud metadata, internal services)
+- 6 XXE payloads
+- 20 OS command injection payloads
+- CMS-specific wordlists (WordPress plugins, themes, usernames, passwords)
+- Homoglyph and IDN character mappings
+- 11 phishing kit signature fingerprints
+- 12 WAF/CDN detection signatures
+- Service takeover fingerprint database
+
+---
+
 ## Dependencies
 
 All dependencies are listed in `requirements.txt`:
@@ -206,6 +286,7 @@ All dependencies are listed in `requirements.txt`:
 | dnspython | DNS record resolution, zone transfers, DMARC/SPF/DKIM checks | Optional |
 | beautifulsoup4 | HTML parsing for scraping, link extraction, tech detection, JS extraction, CSRF analysis | Optional |
 | Pillow | Image processing and EXIF metadata extraction | Optional |
+| PySocks | SOCKS proxy support for Stealth Mode (Tor / SOCKS5) | Optional |
 
 Install all at once with:
 
