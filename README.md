@@ -157,10 +157,10 @@ export GROQ_API_KEY=gsk_your_key_here
 uvicorn main:app --reload
 ```
 
-Then set the `ARGUS_API_URL` environment variable before running ARGUS:
+Then set the `API_URL` environment variable before running ARGUS:
 
 ```bash
-export ARGUS_API_URL=http://localhost:8000
+export API_URL=http://localhost:8000
 python3 argus.py
 ```
 
