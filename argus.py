@@ -1351,9 +1351,13 @@ def port_scanner():
 
     spinner("Resolving host...", 0.5)
     try:
-        ip = socket.gethostbyname(host)
+        if STEALTH["enabled"] and dns is not None:
+            answers = dns.resolver.resolve(host, "A", lifetime=10)
+            ip = str(answers[0])
+        else:
+            ip = socket.gethostbyname(host)
         print_row("Resolved IP", ip)
-    except socket.gaierror:
+    except Exception:
         print_err("Could not resolve hostname")
         return
 
@@ -1870,9 +1874,13 @@ def traceroute():
 
     spinner("Resolving host...", 0.5)
     try:
-        dest_ip = socket.gethostbyname(host)
+        if STEALTH["enabled"] and dns is not None:
+            answers = dns.resolver.resolve(host, "A", lifetime=10)
+            dest_ip = str(answers[0])
+        else:
+            dest_ip = socket.gethostbyname(host)
         print_row("Target", f"{host} ({dest_ip})")
-    except socket.gaierror:
+    except Exception:
         print_err("Could not resolve hostname")
         return
 
@@ -2279,7 +2287,11 @@ def dns_zone_transfer():
     for ns in nameservers:
         print(f"\n  {M}── Testing {ns} ──{RST}")
         try:
-            ns_ip = socket.gethostbyname(ns)
+            if STEALTH["enabled"]:
+                ns_answers = dns.resolver.resolve(ns, "A", lifetime=10)
+                ns_ip = str(ns_answers[0])
+            else:
+                ns_ip = socket.gethostbyname(ns)
             zone = dns.zone.from_xfr(dns.query.xfr(ns_ip, domain, timeout=5))
             print_err(f"Zone transfer SUCCEEDED on {ns}!")
             vulnerable = True
@@ -3056,9 +3068,13 @@ def subdomain_brute():
     def resolve_sub(sub):
         fqdn = f"{sub}.{domain}"
         try:
-            ip = socket.gethostbyname(fqdn)
+            if STEALTH["enabled"] and dns is not None:
+                answers = dns.resolver.resolve(fqdn, "A", lifetime=10)
+                ip = str(answers[0])
+            else:
+                ip = socket.gethostbyname(fqdn)
             return fqdn, ip
-        except socket.gaierror:
+        except Exception:
             return None
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
@@ -3843,8 +3859,11 @@ def subdomain_takeover():
 
         # Check if CNAME target resolves
         try:
-            socket.gethostbyname(cname)
-        except socket.gaierror:
+            if STEALTH["enabled"] and dns is not None:
+                dns.resolver.resolve(cname, "A", lifetime=10)
+            else:
+                socket.gethostbyname(cname)
+        except Exception:
             print_warn(f"{sub} -> {cname} (CNAME does not resolve!)")
             vulnerable.append((sub, cname, "NXDOMAIN"))
             continue
@@ -6502,8 +6521,12 @@ def tcp_flood():
         return
 
     try:
-        ip = socket.gethostbyname(host)
-    except socket.gaierror:
+        if STEALTH["enabled"] and dns is not None:
+            answers = dns.resolver.resolve(host, "A", lifetime=10)
+            ip = str(answers[0])
+        else:
+            ip = socket.gethostbyname(host)
+    except Exception:
         print_err("Could not resolve hostname")
         return
 
@@ -6585,8 +6608,12 @@ def udp_flood():
         return
 
     try:
-        ip = socket.gethostbyname(host)
-    except socket.gaierror:
+        if STEALTH["enabled"] and dns is not None:
+            answers = dns.resolver.resolve(host, "A", lifetime=10)
+            ip = str(answers[0])
+        else:
+            ip = socket.gethostbyname(host)
+    except Exception:
         print_err("Could not resolve hostname")
         return
 
@@ -6667,8 +6694,12 @@ def icmp_flood():
         return
 
     try:
-        ip = socket.gethostbyname(host)
-    except socket.gaierror:
+        if STEALTH["enabled"] and dns is not None:
+            answers = dns.resolver.resolve(host, "A", lifetime=10)
+            ip = str(answers[0])
+        else:
+            ip = socket.gethostbyname(host)
+    except Exception:
         print_err("Could not resolve hostname")
         return
 
@@ -7119,6 +7150,17 @@ def websocket_flood():
     path = parsed.path or "/"
     use_ssl = parsed.scheme == "wss"
 
+    # Pre-resolve hostname to IP so workers don't trigger DNS leak block
+    try:
+        if STEALTH["enabled"] and dns is not None:
+            answers = dns.resolver.resolve(host, "A", lifetime=10)
+            resolved_ip = str(answers[0])
+        else:
+            resolved_ip = socket.gethostbyname(host)
+    except Exception:
+        print_err("Could not resolve hostname")
+        return
+
     def ws_worker():
         while not stop_event.is_set():
             try:
@@ -7130,7 +7172,7 @@ def websocket_flood():
                     ctx.check_hostname = False
                     ctx.verify_mode = _ssl.CERT_NONE
                     s = ctx.wrap_socket(s, server_hostname=host)
-                s.connect((host, port))
+                s.connect((resolved_ip, port))
 
                 # WebSocket handshake
                 key = ''.join(random.choices(string.ascii_letters, k=16))
@@ -7346,9 +7388,12 @@ def homoglyph_generator():
 
         def check_domain(dom):
             try:
-                socket.gethostbyname(dom)
+                if STEALTH["enabled"] and dns is not None:
+                    dns.resolver.resolve(dom, "A", lifetime=10)
+                else:
+                    socket.gethostbyname(dom)
                 return dom
-            except socket.gaierror:
+            except Exception:
                 return None
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=30) as executor:
@@ -7695,9 +7740,12 @@ def typosquat_generator():
 
         def check_dom(d):
             try:
-                socket.gethostbyname(d)
+                if STEALTH["enabled"] and dns is not None:
+                    dns.resolver.resolve(d, "A", lifetime=10)
+                else:
+                    socket.gethostbyname(d)
                 return d
-            except socket.gaierror:
+            except Exception:
                 return None
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=30) as executor:
@@ -7975,7 +8023,11 @@ def url_obfuscator():
 
     # Resolve IP
     try:
-        ip = socket.gethostbyname(host)
+        if STEALTH["enabled"] and dns is not None:
+            answers = dns.resolver.resolve(host, "A", lifetime=10)
+            ip = str(answers[0])
+        else:
+            ip = socket.gethostbyname(host)
         octets = list(map(int, ip.split(".")))
     except Exception:
         ip = None
