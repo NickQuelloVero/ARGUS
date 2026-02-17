@@ -9,9 +9,9 @@
     ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚══════╝
 ```
 
-**v5.0.0** // 80+ tools across four categories
+**v5.1.0** // 81 tools across four categories + AI-powered search
 
-ARGUS is a comprehensive terminal-based OSINT and security toolkit written in Python. It provides **80 tools** organized into four categories (reconnaissance, exploitation testing, stress testing, and phishing simulation), all accessible through an interactive two-column menu. It features a hardened **Stealth Mode** with multi-layer anonymization: Tor/SOCKS5/HTTP proxy routing, IPv6 leak blocking, DNS leak prevention, full HTTP fingerprint randomization, MAC address spoofing, and Tor circuit rotation.
+ARGUS is a comprehensive terminal-based OSINT and security toolkit written in Python. It provides **81 tools** organized into four categories (reconnaissance, exploitation testing, stress testing, and phishing simulation), all accessible through an interactive two-column menu. It includes an **AI Search** feature that uses natural language to find the best tool for your needs. It also features a hardened **Stealth Mode** with multi-layer anonymization: Tor/SOCKS5/HTTP proxy routing, IPv6 leak blocking, DNS leak prevention, full HTTP fingerprint randomization, MAC address spoofing, and Tor circuit rotation.
 
 ---
 
@@ -21,6 +21,8 @@ ARGUS is a comprehensive terminal-based OSINT and security toolkit written in Py
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Usage](#usage)
+- [AI Search](#ai-search)
+- [API Backend](#api-backend)
 - [Stealth Mode](#stealth-mode)
   - [Protection Layers](#protection-layers)
   - [Kill-Switch](#kill-switch)
@@ -28,7 +30,7 @@ ARGUS is a comprehensive terminal-based OSINT and security toolkit written in Py
   - [Known Limitations](#known-limitations)
 - [Tools](#tools)
   - [OSINT and Reconnaissance (40)](#osint-and-reconnaissance)
-  - [Exploitation Testing (20)](#exploitation-testing)
+  - [Exploitation Testing (21)](#exploitation-testing)
   - [Stress Testing (10)](#stress-testing)
   - [Phishing Simulation (10)](#phishing-simulation)
 - [Authorization System](#authorization-system)
@@ -103,13 +105,66 @@ Launch ARGUS from the terminal:
 python3 argus.py
 ```
 
-An interactive two-column menu will appear with all 80 tools organized by category. Enter the number corresponding to the tool you want to use and follow the on-screen prompts. Press `S` to open Stealth Mode configuration. Press `0` to exit. You can interrupt any running operation with `Ctrl+C`.
+An interactive two-column menu will appear with all 81 tools organized by category. Enter the number corresponding to the tool you want to use and follow the on-screen prompts. Press `A` to open AI Search, `S` to open Stealth Mode configuration, or `0` to exit. You can interrupt any running operation with `Ctrl+C`.
 
 The menu is color-coded by category:
 
 - **Cyan** = OSINT / Reconnaissance
 - **Red** = Exploitation and Stress Testing
 - **Magenta** = Phishing Simulation
+- **Green** = AI Search
+
+---
+
+## AI Search
+
+ARGUS includes an AI-powered search feature that helps you find the right tool using natural language. Press `A` from the main menu, describe what you want to do (e.g. "scan a website for SQL injection" or "find subdomains of a target"), and the AI will return up to 3 matching tools ranked by relevance with an explanation of why each tool fits your query. You can then launch the selected tool directly from the results.
+
+AI Search connects to a remote API backend hosted on Vercel. No API key or local setup is required on the client side.
+
+---
+
+## API Backend
+
+The `api/` folder contains the backend that powers AI Search. It is a FastAPI application deployed on Vercel that uses Groq (LLM inference) to match natural language queries against the full ARGUS tool catalog.
+
+### Structure
+
+```
+api/
+├── main.py              # FastAPI app with /search and /tools endpoints
+├── tools_catalog.py     # Static catalog of all 81 tools with descriptions
+├── requirements.txt     # Python dependencies (fastapi, groq, uvicorn)
+├── vercel.json          # Vercel deployment configuration
+└── .env.example         # Template for the GROQ_API_KEY environment variable
+```
+
+### Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/search?q=...` | GET | Takes a natural language query, sends it to Groq (Llama 3.3 70B), and returns up to 3 matching tools with relevance explanations |
+| `/tools` | GET | Returns the full catalog of all 81 tools |
+
+### Self-hosting
+
+If you want to host the API yourself:
+
+```bash
+cd api
+pip install -r requirements.txt
+export GROQ_API_KEY=gsk_your_key_here
+uvicorn main:app --reload
+```
+
+Then set the `ARGUS_API_URL` environment variable before running ARGUS:
+
+```bash
+export ARGUS_API_URL=http://localhost:8000
+python3 argus.py
+```
+
+By default, ARGUS connects to the hosted instance at `https://argusbackend-psi.vercel.app`.
 
 ---
 
@@ -228,7 +283,7 @@ These are inherent limitations of the proxy/Tor architecture and cannot be fully
 
 ### Exploitation Testing
 
-20 tools for vulnerability assessment. All require authorization confirmation before use.
+21 tools for vulnerability assessment. All require authorization confirmation before use.
 
 | # | Tool | Description |
 |---|------|-------------|
@@ -252,6 +307,7 @@ These are inherent limitations of the proxy/Tor architecture and cannot be fully
 | 58 | Insecure Cookie Checker | Analyzes all Set-Cookie headers for missing Secure, HttpOnly, and SameSite flags. |
 | 59 | CSRF Token Analyzer | Scans HTML forms for CSRF token presence and quality, checks meta tags and CORS headers. |
 | 60 | Prototype Pollution Scanner | Tests prototype pollution via query parameters and JSON body payloads. |
+| 61 | Supabase RLS Auditor | Scans a website using Supabase for exposed project URLs and anon keys, then tests all discoverable tables for Row-Level Security (RLS) misconfigurations. |
 
 ### Stress Testing
 
@@ -259,16 +315,16 @@ These are inherent limitations of the proxy/Tor architecture and cannot be fully
 
 | # | Tool | Description |
 |---|------|-------------|
-| 61 | HTTP Flood (GET/POST) | Sends a high volume of HTTP requests with random user-agents and X-Forwarded-For spoofing. Configurable threads (1-200) and duration (1-300s). |
-| 62 | Slowloris | Holds concurrent connections open by sending partial HTTP headers, exhausting the server's connection pool. |
-| 63 | Slow POST (R.U.D.Y.) | Sends HTTP POST requests with extremely slow body transmission to keep connections occupied. |
-| 64 | TCP Connection Flood | Opens a large number of raw TCP connections to a target host and port. |
-| 65 | UDP Flood | Sends a continuous stream of random UDP packets to a target host and port. |
-| 66 | ICMP Ping Flood | Sends a high volume of ICMP echo request packets (requires root/admin privileges on some systems). |
-| 67 | HTTP Slow Read | Sends legitimate HTTP requests but reads the response extremely slowly, tying up server resources. |
-| 68 | GoldenEye (Keep-Alive Flood) | Floods with HTTP requests using persistent Keep-Alive connections and randomized headers. |
-| 69 | DNS Flood | Floods a DNS server with queries for random subdomains. Configurable threads and duration. |
-| 70 | WebSocket Flood | Opens multiple WebSocket connections and floods with masked frames. Configurable connections, duration, and message size. |
+| 62 | HTTP Flood (GET/POST) | Sends a high volume of HTTP requests with random user-agents and X-Forwarded-For spoofing. Configurable threads (1-200) and duration (1-300s). |
+| 63 | Slowloris | Holds concurrent connections open by sending partial HTTP headers, exhausting the server's connection pool. |
+| 64 | Slow POST (R.U.D.Y.) | Sends HTTP POST requests with extremely slow body transmission to keep connections occupied. |
+| 65 | TCP Connection Flood | Opens a large number of raw TCP connections to a target host and port. |
+| 66 | UDP Flood | Sends a continuous stream of random UDP packets to a target host and port. |
+| 67 | ICMP Ping Flood | Sends a high volume of ICMP echo request packets (requires root/admin privileges on some systems). |
+| 68 | HTTP Slow Read | Sends legitimate HTTP requests but reads the response extremely slowly, tying up server resources. |
+| 69 | GoldenEye (Keep-Alive Flood) | Floods with HTTP requests using persistent Keep-Alive connections and randomized headers. |
+| 70 | DNS Flood | Floods a DNS server with queries for random subdomains. Configurable threads and duration. |
+| 71 | WebSocket Flood | Opens multiple WebSocket connections and floods with masked frames. Configurable connections, duration, and message size. |
 
 ### Phishing Simulation
 
@@ -276,16 +332,16 @@ These are inherent limitations of the proxy/Tor architecture and cannot be fully
 
 | # | Tool | Description |
 |---|------|-------------|
-| 71 | Homoglyph Domain Generator | Generates lookalike domains using Unicode/Cyrillic homoglyphs, typo swaps, missing/doubled chars, and QWERTY adjacency. Optionally checks registration. |
-| 72 | Phishing URL Analyzer | Scores a suspicious URL (0-100) by checking for IP usage, suspicious TLDs, brand impersonation, encoding, URL shorteners, and urgency keywords. |
-| 73 | Email Spoofing Checker | Evaluates a domain's email spoofing resistance by checking SPF, DMARC, DKIM, and MTA-STS records. |
-| 74 | Typosquatting Generator | Generates typosquatted domain variations via bit-flips, vowel swaps, dot insertion, prefix/suffix abuse, and hyphenation. Optionally checks registration. |
-| 75 | Credential Harvester Template Generator | Generates 8 ready-to-use phishing page templates (Generic Login, Office 365, Google, VPN Portal, WiFi Captive Portal, Password Reset, 2FA, File Share) with configurable callback URL and company name. |
-| 76 | URL Obfuscator | Obfuscates a URL using 10+ techniques: decimal/hex/octal IP, @ redirect, subdomain spoof, RTL Unicode override, URL credentials, fragment trick. |
-| 77 | Email Header Analyzer | Analyzes raw email headers for phishing indicators: SPF/DKIM/DMARC results, From/Return-Path mismatch, Reply-To mismatch, suspicious mailers, and urgency tactics. Outputs a phishing score. |
-| 78 | IDN Homograph Attack Generator | Generates internationalized domain names using Cyrillic character substitution with punycode output. Supports single, multi, and full-script replacement. |
-| 79 | Phishing Kit Detector | Scans a suspicious URL for signatures of 11 known phishing kits (GoPhish, Evilginx2, King Phisher, SET, Modlishka, etc.) plus behavioral indicators. |
-| 80 | Phishing Campaign Planner | Generates an intelligence report for a target domain: email security posture, mail infrastructure, web presence, ranked pretexts, timing recommendations, and evasion tips. |
+| 72 | Homoglyph Domain Generator | Generates lookalike domains using Unicode/Cyrillic homoglyphs, typo swaps, missing/doubled chars, and QWERTY adjacency. Optionally checks registration. |
+| 73 | Phishing URL Analyzer | Scores a suspicious URL (0-100) by checking for IP usage, suspicious TLDs, brand impersonation, encoding, URL shorteners, and urgency keywords. |
+| 74 | Email Spoofing Checker | Evaluates a domain's email spoofing resistance by checking SPF, DMARC, DKIM, and MTA-STS records. |
+| 75 | Typosquatting Generator | Generates typosquatted domain variations via bit-flips, vowel swaps, dot insertion, prefix/suffix abuse, and hyphenation. Optionally checks registration. |
+| 76 | Credential Harvester Template Generator | Generates 8 ready-to-use phishing page templates (Generic Login, Office 365, Google, VPN Portal, WiFi Captive Portal, Password Reset, 2FA, File Share) with configurable callback URL and company name. |
+| 77 | URL Obfuscator | Obfuscates a URL using 10+ techniques: decimal/hex/octal IP, @ redirect, subdomain spoof, RTL Unicode override, URL credentials, fragment trick. |
+| 78 | Email Header Analyzer | Analyzes raw email headers for phishing indicators: SPF/DKIM/DMARC results, From/Return-Path mismatch, Reply-To mismatch, suspicious mailers, and urgency tactics. Outputs a phishing score. |
+| 79 | IDN Homograph Attack Generator | Generates internationalized domain names using Cyrillic character substitution with punycode output. Supports single, multi, and full-script replacement. |
+| 80 | Phishing Kit Detector | Scans a suspicious URL for signatures of 11 known phishing kits (GoPhish, Evilginx2, King Phisher, SET, Modlishka, etc.) plus behavioral indicators. |
+| 81 | Phishing Campaign Planner | Generates an intelligence report for a target domain: email security posture, mail infrastructure, web presence, ranked pretexts, timing recommendations, and evasion tips. |
 
 ---
 
@@ -296,9 +352,9 @@ ARGUS enforces a three-tier authorization model based on tool category:
 | Category | Tools | Authorization |
 |----------|-------|---------------|
 | OSINT / Reconnaissance | 1-40 | None required. Runs immediately. |
-| Exploitation Testing | 41-60 | Single confirmation: you must confirm you have authorization to test the target. |
-| Stress Testing | 61-70 | Double confirmation: confirm authorization **and** type `I ACCEPT ALL RESPONSIBILITY`. |
-| Phishing Simulation | 71-80 | Double confirmation: confirm authorization **and** type `I ACCEPT ALL RESPONSIBILITY`. |
+| Exploitation Testing | 41-61 | Single confirmation: you must confirm you have authorization to test the target. |
+| Stress Testing | 62-71 | Double confirmation: confirm authorization **and** type `I ACCEPT ALL RESPONSIBILITY`. |
+| Phishing Simulation | 72-81 | Double confirmation: confirm authorization **and** type `I ACCEPT ALL RESPONSIBILITY`. |
 
 ---
 
