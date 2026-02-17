@@ -8618,7 +8618,7 @@ PHISHING_ITEMS = [
 MENU_ITEMS = RECON_ITEMS + EXPLOIT_ITEMS + STRESS_ITEMS + PHISHING_ITEMS
 
 
-AI_SEARCH_API = "https://argusbackend-psi.vercel.app"
+AI_SEARCH_API = os.environ.get("API_URL") or "https://argusbackend-psi.vercel.app"
 
 
 def ai_search():
