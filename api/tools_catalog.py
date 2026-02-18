@@ -240,251 +240,257 @@ TOOLS = [
         "category": "OSINT / Reconnaissance",
         "description": "Scans a CIDR range or IP range for live hosts via TCP connect on ports 80, 443, and 22."
     },
-    # ── Exploitation Testing (41-61) ──
     {
         "id": 41,
+        "name": "Vibe-Coded Site Finder",
+        "category": "OSINT / Reconnaissance",
+        "description": "Given a project or app name, checks for its existence across 25+ vibe-coding hosting platforms (Vercel, Netlify, Lovable, Replit, Render, Railway, Firebase, Cloudflare Pages, HuggingFace Spaces, Streamlit, etc.)."
+    },
+    # ── Exploitation Testing (42-62) ──
+    {
+        "id": 42,
         "name": "SQL Injection Tester",
         "category": "Exploitation Testing",
         "description": "Tests URL parameters with 20 SQL injection payloads (union, blind, time-based, error-based)."
     },
     {
-        "id": 42,
+        "id": 43,
         "name": "XSS Scanner (Reflected)",
         "category": "Exploitation Testing",
         "description": "Scans URL parameters with 18 XSS payload vectors including event handlers and encoding bypasses."
     },
     {
-        "id": 43,
+        "id": 44,
         "name": "Directory / File Bruteforcer",
         "category": "Exploitation Testing",
         "description": "Discovers hidden directories and files on a web server using a 67-entry wordlist with multi-threading."
     },
     {
-        "id": 44,
+        "id": 45,
         "name": "CORS Misconfiguration Scanner",
         "category": "Exploitation Testing",
         "description": "Checks whether a target's CORS policy allows unauthorized cross-origin requests."
     },
     {
-        "id": 45,
+        "id": 46,
         "name": "Open Redirect Scanner",
         "category": "Exploitation Testing",
         "description": "Tests URL parameters with 15 open redirect payloads including protocol and hostname confusion tricks."
     },
     {
-        "id": 46,
+        "id": 47,
         "name": "LFI / Path Traversal Tester",
         "category": "Exploitation Testing",
         "description": "Tests 20 LFI payloads with 6 file signature detections (path traversal, PHP wrappers, log injection)."
     },
     {
-        "id": 47,
+        "id": 48,
         "name": "Subdomain Takeover Check",
         "category": "Exploitation Testing",
         "description": "Checks whether subdomains point to unclaimed external services and are vulnerable to takeover."
     },
     {
-        "id": 48,
+        "id": 49,
         "name": "Reverse Shell Generator",
         "category": "Exploitation Testing",
         "description": "Generates reverse shell one-liners in 11 languages (Bash, Python, Perl, PHP, Ruby, PowerShell, Java, Netcat, socat, Lua, xterm)."
     },
     {
-        "id": 49,
+        "id": 50,
         "name": "CMS Vulnerability Scanner",
         "category": "Exploitation Testing",
         "description": "Scans for known vulnerabilities in WordPress, Joomla, and Drupal installations."
     },
     {
-        "id": 50,
+        "id": 51,
         "name": "Payload Encoder / Decoder",
         "category": "Exploitation Testing",
         "description": "Encodes and decodes payloads in 11 modes (URL, Base64, Hex, HTML entities, Unicode, double URL, MD5/SHA hashing)."
     },
     {
-        "id": 51,
+        "id": 52,
         "name": "CRLF Injection Tester",
         "category": "Exploitation Testing",
         "description": "Tests 10 CRLF payloads for header injection and HTTP response splitting."
     },
     {
-        "id": 52,
+        "id": 53,
         "name": "SSRF Tester",
         "category": "Exploitation Testing",
         "description": "Tests 20 SSRF payloads targeting localhost, cloud metadata endpoints (AWS/GCP/Azure), and internal services."
     },
     {
-        "id": 53,
+        "id": 54,
         "name": "JWT Analyzer",
         "category": "Exploitation Testing",
         "description": "Decodes JWT headers and payloads, checks expiry, analyzes algorithm security, and brute-forces common HMAC secrets."
     },
     {
-        "id": 54,
+        "id": 55,
         "name": "Clickjacking Tester",
         "category": "Exploitation Testing",
         "description": "Checks X-Frame-Options and CSP frame-ancestors, generates proof-of-concept HTML if vulnerable."
     },
     {
-        "id": 55,
+        "id": 56,
         "name": "XXE Tester",
         "category": "Exploitation Testing",
         "description": "Tests 6 XML External Entity payloads (file read, SSRF, PHP wrappers) against XML-accepting endpoints."
     },
     {
-        "id": 56,
+        "id": 57,
         "name": "Command Injection Tester",
         "category": "Exploitation Testing",
         "description": "Tests 20 OS command injection payloads with time-based and output-based detection."
     },
     {
-        "id": 57,
+        "id": 58,
         "name": "Host Header Injection",
         "category": "Exploitation Testing",
         "description": "Tests 10 host header manipulation vectors (X-Forwarded-Host, Forwarded, X-Original-URL, etc.)."
     },
     {
-        "id": 58,
+        "id": 59,
         "name": "Insecure Cookie Checker",
         "category": "Exploitation Testing",
         "description": "Analyzes all Set-Cookie headers for missing Secure, HttpOnly, and SameSite flags."
     },
     {
-        "id": 59,
+        "id": 60,
         "name": "CSRF Token Analyzer",
         "category": "Exploitation Testing",
         "description": "Scans HTML forms for CSRF token presence and quality, checks meta tags and CORS headers."
     },
     {
-        "id": 60,
+        "id": 61,
         "name": "Prototype Pollution Scanner",
         "category": "Exploitation Testing",
         "description": "Tests prototype pollution via query parameters and JSON body payloads."
     },
     {
-        "id": 61,
+        "id": 62,
         "name": "Supabase RLS Auditor",
         "category": "Exploitation Testing",
         "description": "Scans a website using Supabase for exposed project URLs and anon keys, then tests all discoverable tables for Row-Level Security (RLS) misconfigurations."
     },
-    # ── Stress Testing / Denial of Service (62-71) ──
+    # ── Stress Testing / Denial of Service (63-72) ──
     {
-        "id": 62,
+        "id": 63,
         "name": "HTTP Flood (GET/POST)",
         "category": "Stress Testing",
         "description": "Sends a high volume of HTTP requests with random user-agents and X-Forwarded-For spoofing. Configurable threads and duration."
     },
     {
-        "id": 63,
+        "id": 64,
         "name": "Slowloris",
         "category": "Stress Testing",
         "description": "Holds concurrent connections open by sending partial HTTP headers, exhausting the server's connection pool."
     },
     {
-        "id": 64,
+        "id": 65,
         "name": "Slow POST (R.U.D.Y.)",
         "category": "Stress Testing",
         "description": "Sends HTTP POST requests with extremely slow body transmission to keep connections occupied."
     },
     {
-        "id": 65,
+        "id": 66,
         "name": "TCP Connection Flood",
         "category": "Stress Testing",
         "description": "Opens a large number of raw TCP connections to a target host and port."
     },
     {
-        "id": 66,
+        "id": 67,
         "name": "UDP Flood",
         "category": "Stress Testing",
         "description": "Sends a continuous stream of random UDP packets to a target host and port."
     },
     {
-        "id": 67,
+        "id": 68,
         "name": "ICMP Ping Flood",
         "category": "Stress Testing",
         "description": "Sends a high volume of ICMP echo request packets (requires root/admin privileges on some systems)."
     },
     {
-        "id": 68,
+        "id": 69,
         "name": "HTTP Slow Read",
         "category": "Stress Testing",
         "description": "Sends legitimate HTTP requests but reads the response extremely slowly, tying up server resources."
     },
     {
-        "id": 69,
+        "id": 70,
         "name": "GoldenEye (Keep-Alive Flood)",
         "category": "Stress Testing",
         "description": "Floods with HTTP requests using persistent Keep-Alive connections and randomized headers."
     },
     {
-        "id": 70,
+        "id": 71,
         "name": "DNS Flood",
         "category": "Stress Testing",
         "description": "Floods a DNS server with queries for random subdomains. Configurable threads and duration."
     },
     {
-        "id": 71,
+        "id": 72,
         "name": "WebSocket Flood",
         "category": "Stress Testing",
         "description": "Opens multiple WebSocket connections and floods with masked frames. Configurable connections, duration, and message size."
     },
-    # ── Phishing Simulation (72-81) ──
+    # ── Phishing Simulation (73-82) ──
     {
-        "id": 72,
+        "id": 73,
         "name": "Homoglyph Domain Generator",
         "category": "Phishing Simulation",
         "description": "Generates lookalike domains using Unicode/Cyrillic homoglyphs, typo swaps, missing/doubled chars, and QWERTY adjacency."
     },
     {
-        "id": 73,
+        "id": 74,
         "name": "Phishing URL Analyzer",
         "category": "Phishing Simulation",
         "description": "Scores a suspicious URL (0-100) by checking for IP usage, suspicious TLDs, brand impersonation, encoding, URL shorteners, and urgency keywords."
     },
     {
-        "id": 74,
+        "id": 75,
         "name": "Email Spoofing Checker",
         "category": "Phishing Simulation",
         "description": "Evaluates a domain's email spoofing resistance by checking SPF, DMARC, DKIM, and MTA-STS records."
     },
     {
-        "id": 75,
+        "id": 76,
         "name": "Typosquatting Generator",
         "category": "Phishing Simulation",
         "description": "Generates typosquatted domain variations via bit-flips, vowel swaps, dot insertion, prefix/suffix abuse, and hyphenation."
     },
     {
-        "id": 76,
+        "id": 77,
         "name": "Credential Harvester Template Generator",
         "category": "Phishing Simulation",
         "description": "Generates 8 ready-to-use phishing page templates (Generic Login, Office 365, Google, VPN Portal, WiFi Captive Portal, Password Reset, 2FA, File Share)."
     },
     {
-        "id": 77,
+        "id": 78,
         "name": "URL Obfuscator",
         "category": "Phishing Simulation",
         "description": "Obfuscates a URL using 10+ techniques: decimal/hex/octal IP, @ redirect, subdomain spoof, RTL Unicode override, URL credentials, fragment trick."
     },
     {
-        "id": 78,
+        "id": 79,
         "name": "Email Header Analyzer",
         "category": "Phishing Simulation",
         "description": "Analyzes raw email headers for phishing indicators: SPF/DKIM/DMARC results, From/Return-Path mismatch, Reply-To mismatch, suspicious mailers."
     },
     {
-        "id": 79,
+        "id": 80,
         "name": "IDN Homograph Attack Generator",
         "category": "Phishing Simulation",
         "description": "Generates internationalized domain names using Cyrillic character substitution with punycode output."
     },
     {
-        "id": 80,
+        "id": 81,
         "name": "Phishing Kit Detector",
         "category": "Phishing Simulation",
         "description": "Scans a suspicious URL for signatures of 11 known phishing kits (GoPhish, Evilginx2, King Phisher, SET, Modlishka, etc.)."
     },
     {
-        "id": 81,
+        "id": 82,
         "name": "Phishing Campaign Planner",
         "category": "Phishing Simulation",
         "description": "Generates an intelligence report for a target domain: email security posture, mail infrastructure, web presence, ranked pretexts, and timing recommendations."

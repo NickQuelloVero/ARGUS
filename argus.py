@@ -641,17 +641,17 @@ def _attempt_start_tor():
         return False
 
     print(f"  {Y}[*] Tor is not running. Attempting to start via systemctl...{RST}")
-    
+
     try:
         # METODO 1: Prova pulita con systemctl (Consigliato)
         # Non usiamo '&', subprocess.call aspetta che il comando 'start' finisca (è immediato)
         res = subprocess.call(["sudo", "systemctl", "start", "tor"])
-        
+
         # Se systemctl fallisce (es. non c'è systemd), proviamo il metodo raw
         if res != 0:
             print(f"  {Y}[!] systemctl failed, trying direct execution...{RST}")
             # METODO 2: Esecuzione diretta
-            # Usiamo Popen invece di call. Popen NON blocca lo script, quindi 
+            # Usiamo Popen invece di call. Popen NON blocca lo script, quindi
             # agisce come la "&" del terminale senza causare l'errore.
             subprocess.Popen(["sudo", "tor"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -661,7 +661,7 @@ def _attempt_start_tor():
                 print(f"  {G}[+] Tor started successfully!{RST}")
                 return True
             time.sleep(1)
-        
+
         print(f"  {R}[!] Timeout: Tor process exists but port 9050 is not open.{RST}")
         return False
     except Exception as e:
@@ -698,7 +698,7 @@ def configure_stealth():
             if socks is None:
                 print(f"  {R}[!] PySocks not installed. Run: pip install PySocks{RST}")
                 continue
-            
+
             # --- CHECK AND AUTO-START TOR WITH SUDO ---
             if not _is_port_open("127.0.0.1", 9050):
                 success = _attempt_start_tor()
@@ -3168,6 +3168,106 @@ def ping_sweep():
                 print(f"    {G}[+]{RST} {C}{ip:<16}{RST} {W}{info}{host_info}{RST}")
 
     print(f"\n  {Y}Alive hosts: {G}{len(alive)}{RST} / {len(ips)} scanned")
+
+
+# ─── 41. Vibe-Coded Site Finder ───────────────────────────────────────────────
+
+VIBE_DOMAINS = {
+    # Vercel
+    "Vercel":           "https://{name}.vercel.app",
+    # Netlify
+    "Netlify":          "https://{name}.netlify.app",
+    # Lovable
+    "Lovable":          "https://{name}.lovable.app",
+    # Replit
+    "Replit":           "https://{name}.repl.co",
+    # Render
+    "Render":           "https://{name}.onrender.com",
+    # Railway
+    "Railway":          "https://{name}.up.railway.app",
+    # Surge
+    "Surge":            "https://{name}.surge.sh",
+    # GitHub Pages
+    "GitHub Pages":     "https://{name}.github.io",
+    # GitLab Pages
+    "GitLab Pages":     "https://{name}.gitlab.io",
+    # Firebase
+    "Firebase":         "https://{name}.web.app",
+    "Firebase (alt)":   "https://{name}.firebaseapp.com",
+    # Fly.io
+    "Fly.io":           "https://{name}.fly.dev",
+    # Cloudflare Pages
+    "Cloudflare Pages": "https://{name}.pages.dev",
+    # Deno Deploy
+    "Deno Deploy":      "https://{name}.deno.dev",
+    # Supabase
+    "Supabase":         "https://{name}.supabase.co",
+    # HuggingFace Spaces
+    "HuggingFace":      "https://{name}.hf.space",
+    # Streamlit
+    "Streamlit":        "https://{name}.streamlit.app",
+    # Glitch
+    "Glitch":           "https://{name}.glitch.me",
+    # Bolt / StackBlitz
+    "StackBlitz":       "https://{name}.stackblitz.io",
+    # Heroku
+    "Heroku":           "https://{name}.herokuapp.com",
+    # Fleek
+    "Fleek":            "https://{name}.on.fleek.co",
+    # Carrd
+    "Carrd":            "https://{name}.carrd.co",
+    # Framer
+    "Framer":           "https://{name}.framer.website",
+    # Webflow
+    "Webflow":          "https://{name}.webflow.io",
+}
+
+
+def _check_vibe_site(name, domain_label, url_tpl, session):
+    url = url_tpl.format(name=name)
+    try:
+        resp = session.get(url, timeout=10, allow_redirects=True)
+        if resp.status_code == 200:
+            ct = resp.headers.get("Content-Type", "")
+            if "text/html" in ct or "application/json" in ct:
+                return domain_label, url, True
+    except Exception:
+        pass
+    return domain_label, url, False
+
+
+def vibe_site_finder():
+    print_header("Vibe-Coded Site Finder")
+    name = prompt("Project / app name")
+    if not name:
+        return
+
+    name = name.lower().strip().replace(" ", "-")
+    print_row("Normalized name", name)
+    print_row("Domains to check", str(len(VIBE_DOMAINS)))
+    spinner("Scanning vibe-coding platforms...", 1.0)
+
+    found = []
+    with requests.Session() as session:
+        session.headers.update({"User-Agent": "Mozilla/5.0 (ARGUS OSINT Tool)"})
+        futures = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=15) as pool:
+            for label, tpl in VIBE_DOMAINS.items():
+                futures[pool.submit(_check_vibe_site, name, label, tpl, session)] = label
+            for future in concurrent.futures.as_completed(futures):
+                label, url, exists = future.result()
+                if exists:
+                    print_ok(f"{label:<20} {G}{url}{RST}")
+                    found.append((label, url))
+                else:
+                    print_err(f"{label:<20} Not found")
+
+    print(f"\n  {Y}Results: {G}{len(found)}{Y}/{len(VIBE_DOMAINS)} platforms{RST}")
+
+    if found:
+        print(f"\n  {C}──── Live sites ────{RST}")
+        for label, url in sorted(found):
+            print(f"    {G}●{RST} {W}{label:<20}{RST} {C}{url}{RST}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -8563,6 +8663,7 @@ RECON_ITEMS = [
     ("Banner Grabbing", banner_grab),
     ("Subdomain Bruteforce", subdomain_brute),
     ("Ping Sweep / Host Discovery", ping_sweep),
+    ("Vibe-Coded Site Finder", vibe_site_finder),
 ]
 
 EXPLOIT_ITEMS = [
