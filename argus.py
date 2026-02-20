@@ -4266,10 +4266,39 @@ def cms_vuln_scanner():
 
     spinner("Detecting CMS...", 1.0)
 
-    # Detect CMS
+    # Detect CMS (with retry on timeout)
     cms = None
+    max_retries = 3
+    resp = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = session.get(url, timeout=(15, 20))
+            break
+        except requests.exceptions.ConnectionError as e:
+            if attempt < max_retries:
+                wait = 3 * attempt
+                print_warn(f"Connection failed (attempt {attempt}/{max_retries}), retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                print_err(f"Could not reach target after {max_retries} attempts: {e}")
+                return
+        except requests.exceptions.Timeout as e:
+            if attempt < max_retries:
+                wait = 3 * attempt
+                print_warn(f"Timeout (attempt {attempt}/{max_retries}), retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                print_err(f"Target timed out after {max_retries} attempts: {e}")
+                return
+        except Exception as e:
+            print_err(f"Could not reach target: {e}")
+            return
+
+    if resp is None:
+        print_err("Could not reach target.")
+        return
+
     try:
-        resp = session.get(url, timeout=10)
         body = resp.text.lower()
         headers = resp.headers
 
@@ -4284,7 +4313,7 @@ def cms_vuln_scanner():
         elif "shopify" in body:
             cms = "Shopify"
     except Exception as e:
-        print_err(f"Could not reach target: {e}")
+        print_err(f"Error parsing response: {e}")
         return
 
     if not cms:
@@ -4415,11 +4444,12 @@ def cms_vuln_scanner():
         except Exception:
             pass
 
-    # ── XML-RPC deep checks (any CMS) ──
-    # Always attempt active XML-RPC verification if xmlrpc.php was found
-    # during path scan, or probe it unconditionally for thoroughness
+    # ── XML-RPC deep checks ──
+    # For WordPress: always probe xmlrpc.php via POST (GET may return 405/redirect
+    # even when the endpoint is fully active, since xmlrpc.php only accepts POST).
+    # For other CMS: probe only if the path scan found it accessible.
     xmlrpc_found = any(f[0] == "/xmlrpc.php" for f in findings)
-    if xmlrpc_found:
+    if xmlrpc_found or cms == "WordPress":
         print(f"\n  {M}── XML-RPC Deep Checks ({cms}) ──{RST}")
         _cms_jitter(1.0, 2.5)
         session.cookies.clear()  # new session fingerprint for XML-RPC phase
