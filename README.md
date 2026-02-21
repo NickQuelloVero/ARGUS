@@ -9,9 +9,9 @@
     ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚══════╝
 ```
 
-**v5.3.0** // 82 tools across four categories + AI Search + Botnet Mode
+**v5.4.0** // 82 tools across four categories + AI Search + Botnet Mode
 
-ARGUS is a comprehensive terminal-based OSINT and security toolkit written in Python. It provides **82 tools** organized into four categories (reconnaissance, exploitation testing, stress testing, and phishing simulation), all accessible through an interactive two-column menu. It includes an **AI Search** feature that uses natural language to find the best tool for your needs, a **Botnet Mode** that automatically collects WordPress sites with XML-RPC DDoS vectors and uses them as pingback amplifiers, and a hardened **Stealth Mode** with multi-layer anonymization: Tor/SOCKS5/HTTP proxy routing, IPv6 leak blocking, DNS leak prevention, full HTTP fingerprint randomization, MAC address spoofing, and Tor circuit rotation.
+ARGUS is a comprehensive terminal-based OSINT and security toolkit written in Python. It provides **82 tools** organized into four categories (reconnaissance, exploitation testing, stress testing, and phishing simulation), all accessible through an interactive two-column menu. It includes an **AI Search** feature that uses natural language to find the best tool for your needs, a **Botnet Mode** that automatically collects WordPress sites with both `system.multicall` and `pingback.ping` XML-RPC vectors and uses them as multicall pingback amplifiers, and a hardened **Stealth Mode** with multi-layer anonymization: Tor/SOCKS5/HTTP proxy routing, IPv6 leak blocking, DNS leak prevention, full HTTP fingerprint randomization, MAC address spoofing, and Tor circuit rotation.
 
 ---
 
@@ -24,6 +24,7 @@ ARGUS is a comprehensive terminal-based OSINT and security toolkit written in Py
 - [AI Search](#ai-search)
 - [Botnet Mode](#botnet-mode)
   - [How It Works](#how-it-works)
+  - [Why Both Vectors Are Required](#why-both-vectors-are-required)
   - [Botnet Menu](#botnet-menu)
   - [JSON Database](#json-database)
 - [API Backend](#api-backend)
@@ -115,7 +116,7 @@ An interactive two-column menu will appear with all 82 tools organized by catego
 |-----|--------|
 | `A` | Open AI Search |
 | `S` | Open Stealth Mode configuration |
-| `B` | Open Botnet Mode (XML-RPC Pingback Amplification) |
+| `B` | Open Botnet Mode (XML-RPC Multicall Pingback Amplification) |
 | `0` | Exit |
 
 You can interrupt any running operation with `Ctrl+C`.
@@ -139,7 +140,7 @@ AI Search connects to a remote API backend hosted on Vercel. No API key or local
 
 ## Botnet Mode
 
-Botnet Mode lets you use vulnerable WordPress sites as **DDoS amplifiers** via XML-RPC `pingback.ping`. Instead of attacking targets directly from your machine, you leverage discovered WordPress installations to flood a victim URL with HTTP requests on your behalf.
+Botnet Mode lets you use vulnerable WordPress sites as **DDoS amplifiers** via XML-RPC `system.multicall` + `pingback.ping`. Instead of sending individual pingback requests, ARGUS batches multiple `pingback.ping` calls inside a single `system.multicall` request, massively amplifying the attack: each HTTP request you send to a relay generates dozens or hundreds of HTTP requests from the relay to the victim.
 
 Press `B` from the main menu to access it. It requires the same double authorization as stress testing tools (confirmation + "I ACCEPT ALL RESPONSIBILITY").
 
@@ -149,39 +150,74 @@ The attack flow has two phases:
 
 **Phase 1 - Discovery (automatic)**
 
-When you run the **CMS Vulnerability Scanner** (tool 50) against a WordPress site, ARGUS probes `/xmlrpc.php` and enumerates all available methods. If `pingback.ping` or `system.multicall` are found, the site is automatically saved to a local JSON database (`botnet_targets.json`) with its URL, detected CMS, and discovered DDoS vectors.
+When you run the **CMS Vulnerability Scanner** (tool 50) against a WordPress site, ARGUS probes `/xmlrpc.php` and enumerates all available methods. If **both** `pingback.ping` **and** `system.multicall` are confirmed active, the site is automatically saved to a local JSON database (`botnet_zombies.json`) with its URL, detected CMS, and discovered vectors. Sites that only have one of the two vectors are **not** saved — both are required for the multicall amplification attack.
 
-**Phase 2 - Amplification (manual)**
+**Phase 2 - Multicall Amplification (manual)**
 
-From Botnet Mode (option B), you select **XML-RPC Pingback Amplification**. You enter the victim URL, configure threads per relay and duration, and ARGUS sends `pingback.ping` requests to every saved WordPress relay. Each relay then makes an HTTP request to the victim URL to "verify" the pingback. The result: if you have 10 relays sending 50 pingbacks each, the victim receives roughly 500 HTTP requests from 10 different IP addresses, none of which are yours.
+From Botnet Mode (option B), you select **XML-RPC Multicall Pingback Amplification** and configure:
+
+| Parameter | Range | Default | Description |
+|-----------|-------|---------|-------------|
+| Victim URL | any URL | — | The target to flood |
+| Threads per relay | 1-50 | 10 | Concurrent threads sending multicalls to each relay |
+| Pings per multicall | 1-500 | 50 | How many `pingback.ping` calls to batch in each `system.multicall` request |
+| Duration | 1-300s | 30 | How long the attack runs |
+
+Each thread sends a `system.multicall` XML payload to the relay's `/xmlrpc.php` containing N `pingback.ping` calls. The relay WordPress server processes each call and makes an HTTP GET to the victim URL to "verify" the pingback. The result: **1 HTTP request from you = N HTTP requests from the relay to the victim**.
 
 ```
-Your machine                WordPress relays              Victim
-    |                            |                          |
-    |--- pingback.ping --------> site1.com/xmlrpc.php       |
-    |--- pingback.ping --------> site2.com/xmlrpc.php       |
-    |--- pingback.ping --------> site3.com/xmlrpc.php       |
-    |                            |                          |
-    |                            site1 --- HTTP GET ------> |
-    |                            site2 --- HTTP GET ------> |
-    |                            site3 --- HTTP GET ------> |
+Your machine                    WordPress relay                    Victim
+    |                                |                                |
+    |── system.multicall ──────────► |  /xmlrpc.php                   |
+    |   (contains 50x pingback.ping) |                                |
+    |                                |── HTTP GET ──────────────────► |
+    |                                |── HTTP GET ──────────────────► |
+    |                                |── HTTP GET ──────────────────► |
+    |                                |   ... ×50 per multicall        |
+    |                                |                                |
+    |── system.multicall ──────────► |  (next request)                |
+    |   (another 50x pingback.ping)  |                                |
+    |                                |── HTTP GET ──────────────────► |  ×50 more
 ```
+
+**Amplification math**: with 192 relays, 10 threads/relay, and batch size 50:
+- You send: 1,920 concurrent multicall streams
+- Each multicall triggers 50 pingbacks
+- The victim receives up to ~38,400 HTTP requests/second from 192 different IPs, none of which are yours
+
+During the attack, a live status line shows:
+- Total pingbacks triggered
+- Total HTTP requests sent to relays
+- Rate (pingbacks/second)
+- Errors
+- Per-relay breakdown
+
+### Why Both Vectors Are Required
+
+`system.multicall` and `pingback.ping` serve different roles in the amplification chain:
+
+| Vector | Role |
+|--------|------|
+| `pingback.ping` | The actual DDoS primitive — WordPress makes an HTTP GET to the victim URL to "verify" the pingback source |
+| `system.multicall` | The multiplier — batches N `pingback.ping` calls into a single HTTP request, so 1 request from you = N requests from the relay |
+
+Without `system.multicall`, you can only send one `pingback.ping` per HTTP request (1:1 ratio, no amplification). Without `pingback.ping`, `system.multicall` has nothing to batch. Both are needed for the amplification to work.
 
 ### Botnet Menu
 
 | Option | Description |
 |--------|-------------|
-| 1 | **XML-RPC Pingback Amplification** - Uses all saved relays with `pingback.ping` to flood a victim URL. Configurable threads per relay (1-50) and duration (1-300s). Shows live stats with per-relay pingback counts and total rate. |
-| 2 | **Add target manually** - Add a WordPress site URL to the database without scanning it first. |
-| 3 | **Remove target** - Remove a specific target from the database by number. |
-| 4 | **Clear all targets** - Wipe the entire database. |
+| 1 | **XML-RPC Multicall Pingback Amplification** - Uses all saved relays to flood a victim URL. Configurable threads per relay (1-50), pings per multicall batch (1-500), and duration (1-300s). Shows live stats with per-relay pingback counts, HTTP request counts, and total rate. |
+| 2 | **Add zombie manually** - Add a WordPress site URL to the database without scanning it first. |
+| 3 | **Remove zombie** - Remove a specific zombie from the database by number. |
+| 4 | **Clear all zombies** - Wipe the entire database. |
 | 0 | Back to main menu |
 
-The menu header shows the total number of targets in the database. Each target is listed with its URL, CMS type, discovered vectors, and the date it was added.
+The menu header shows the total number of zombies in the database. Each zombie is listed with its URL, CMS type, discovered vectors, and the date it was added.
 
 ### JSON Database
 
-Targets are stored in `botnet_targets.json` in the project root. The file is created automatically the first time a DDoS vector is discovered. Each entry contains:
+Zombies are stored in `botnet_zombies.json` in the project root. The file is created automatically the first time both DDoS vectors are discovered on a target. Each entry contains:
 
 ```json
 {
@@ -198,10 +234,10 @@ Targets are stored in `botnet_targets.json` in the project root. The file is cre
 |-------|-------------|
 | `url` | The base URL of the WordPress site |
 | `cms` | Detected CMS (WordPress, Manual, etc.) |
-| `vectors` | List of confirmed DDoS vectors (e.g. `pingback.ping`, `system.multicall`) |
+| `vectors` | List of confirmed DDoS vectors — always contains both `pingback.ping` and `system.multicall` for auto-discovered sites |
 | `xmlrpc_url` | Full URL to the XML-RPC endpoint |
-| `added` | ISO timestamp of when the target was first discovered |
-| `last_seen` | ISO timestamp of the most recent scan that confirmed the target |
+| `added` | ISO timestamp of when the zombie was first discovered |
+| `last_seen` | ISO timestamp of the most recent scan that confirmed the zombie |
 
 If you scan the same site again, the existing entry is updated (vectors are merged, `last_seen` is refreshed) rather than creating a duplicate.
 
@@ -379,7 +415,7 @@ These are inherent limitations of the proxy/Tor architecture and cannot be fully
 | 47 | LFI / Path Traversal Tester | Tests 20 LFI payloads with 6 file signature detections (path traversal, PHP wrappers, log injection). |
 | 48 | Subdomain Takeover Check | Checks whether subdomains point to unclaimed external services and are vulnerable to takeover. |
 | 49 | Reverse Shell Generator | Generates reverse shell one-liners in 11 languages (Bash, Python, Perl, PHP, Ruby, PowerShell, Java, Netcat, socat, Lua, xterm). |
-| 50 | CMS Vulnerability Scanner | Scans for known vulnerabilities in WordPress, Joomla, and Drupal installations. For WordPress, performs deep XML-RPC analysis: tests `system.multicall` brute-force amplification, `pingback.ping` SSRF, and username oracle attacks. **If DDoS vectors are found, the site is automatically saved to the Botnet targets database.** |
+| 50 | CMS Vulnerability Scanner | Scans for known vulnerabilities in WordPress, Joomla, and Drupal installations. For WordPress, performs deep XML-RPC analysis: tests `system.multicall` brute-force amplification, `pingback.ping` SSRF, and username oracle attacks. **If both `system.multicall` and `pingback.ping` are confirmed active, the site is automatically saved to the Botnet zombie database for multicall amplification.** |
 | 51 | Payload Encoder / Decoder | Encodes and decodes payloads in 11 modes (URL, Base64, Hex, HTML entities, Unicode, double URL, MD5/SHA hashing). |
 | 52 | CRLF Injection Tester | Tests 10 CRLF payloads for header injection and HTTP response splitting. |
 | 53 | SSRF Tester | Tests 20 SSRF payloads targeting localhost, cloud metadata endpoints (AWS/GCP/Azure), and internal services. |
