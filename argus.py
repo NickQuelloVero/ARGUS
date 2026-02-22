@@ -14,6 +14,7 @@ import ipaddress
 import struct
 import sys
 import time
+import gc
 import concurrent.futures
 import threading
 import random
@@ -4255,7 +4256,13 @@ def _cms_scan_single(url, batch_mode=False):
     In batch_mode, brute-force prompts are skipped automatically."""
 
     session = _cms_stealth_session(url)
+    try:
+        return _cms_scan_single_inner(url, batch_mode, session)
+    finally:
+        session.close()
 
+
+def _cms_scan_single_inner(url, batch_mode, session):
     spinner("Detecting CMS...", 1.0)
 
     # Detect CMS (with retry on timeout)
@@ -4395,38 +4402,41 @@ def _cms_scan_single(url, batch_mode=False):
             time.sleep(random.uniform(0.2, 1.2))
             test_url = f"{url}{path}"
             # Session auto-rotates UA/headers via patched send
-            resp = session.get(test_url, timeout=6, allow_redirects=False)
-            return path, desc, resp.status_code, len(resp.content), resp.text[:500]
+            resp = session.get(test_url, timeout=6, allow_redirects=False, stream=True)
+            code = resp.status_code
+            # Read only the first 1KB to check for sensitive content
+            chunk = resp.raw.read(1024)
+            resp.close()  # Release connection immediately
+            preview = chunk.decode("utf-8", errors="replace")[:500]
+            return path, desc, code, len(chunk), preview
         except Exception:
             return path, desc, 0, 0, ""
 
     # Reduced concurrency to lower WAF/IDS burst signature
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
-    futures = [pool.submit(check_path, p) for p in paths]
-    try:
-        for future in concurrent.futures.as_completed(futures, timeout=90):
-            try:
-                path, desc, code, size, preview = future.result(timeout=15)
-            except (concurrent.futures.TimeoutError, Exception):
-                continue
-            if code == 200:
-                risk = ""
-                # Check for sensitive content
-                if any(s in preview.lower() for s in ["password", "db_", "secret", "key", "token"]):
-                    risk = f" {R}[SENSITIVE DATA!]{RST}"
-                print_err(f"{G}200{RST}  {path:<40} {desc}{risk}")
-                findings.append((path, desc, "accessible"))
-            elif code == 403:
-                print(f"  {Y}403{RST}  {path:<40} {desc} (exists but forbidden)")
-                findings.append((path, desc, "forbidden"))
-            elif code in (301, 302):
-                print(f"  {C}{code}{RST}  {path:<40} {desc} (redirect)")
-    except concurrent.futures.TimeoutError:
-        print_warn("Path scan timed out — some paths were not checked")
-        for f in futures:
-            f.cancel()
-    finally:
-        pool.shutdown(wait=False, cancel_futures=True)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [pool.submit(check_path, p) for p in paths]
+        try:
+            for future in concurrent.futures.as_completed(futures, timeout=90):
+                try:
+                    path, desc, code, size, preview = future.result(timeout=15)
+                except (concurrent.futures.TimeoutError, Exception):
+                    continue
+                if code == 200:
+                    risk = ""
+                    # Check for sensitive content
+                    if any(s in preview.lower() for s in ["password", "db_", "secret", "key", "token"]):
+                        risk = f" {R}[SENSITIVE DATA!]{RST}"
+                    print_err(f"{G}200{RST}  {path:<40} {desc}{risk}")
+                    findings.append((path, desc, "accessible"))
+                elif code == 403:
+                    print(f"  {Y}403{RST}  {path:<40} {desc} (exists but forbidden)")
+                    findings.append((path, desc, "forbidden"))
+                elif code in (301, 302):
+                    print(f"  {C}{code}{RST}  {path:<40} {desc} (redirect)")
+        except concurrent.futures.TimeoutError:
+            print_warn("Path scan timed out — some paths were not checked")
+            for f in futures:
+                f.cancel()
 
     # WordPress-specific deep checks
     if cms == "WordPress":
@@ -4609,9 +4619,6 @@ def _cms_scan_single(url, batch_mode=False):
         except Exception:
             pass
 
-    # Close session to release connections before returning
-    session.close()
-
     print(f"\n  {Y}{'═' * 50}{RST}")
     print_row("Findings", str(len(findings)))
     return findings
@@ -4686,6 +4693,10 @@ def cms_vuln_scanner():
             total_findings += n
             if n > 0:
                 vuln_count += 1
+
+            # Free memory between batch iterations
+            del findings
+            gc.collect()
 
             # Jitter between targets in batch mode
             if i < len(targets):
