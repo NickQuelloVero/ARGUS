@@ -26,6 +26,7 @@ ARGUS is a comprehensive terminal-based OSINT and security toolkit written in Py
   - [How It Works](#how-it-works)
   - [Why Both Vectors Are Required](#why-both-vectors-are-required)
   - [Botnet Menu](#botnet-menu)
+  - [Relay Benchmark](#relay-benchmark)
   - [JSON Database](#json-database)
 - [API Backend](#api-backend)
 - [Stealth Mode](#stealth-mode)
@@ -211,9 +212,34 @@ Without `system.multicall`, you can only send one `pingback.ping` per HTTP reque
 | 2 | **Add zombie manually** - Add a WordPress site URL to the database without scanning it first. |
 | 3 | **Remove zombie** - Remove a specific zombie from the database by number. |
 | 4 | **Clear all zombies** - Wipe the entire database. |
+| 5 | **Benchmark relay reliability & power** - Tests relay health, speed, and attack readiness. Choose a single relay, a range (e.g. `1-5`), or all relays at once. See [Relay Benchmark](#relay-benchmark) below. |
 | 0 | Back to main menu |
 
 The menu header shows the total number of zombies in the database. Each zombie is listed with its URL, CMS type, discovered vectors, and the date it was added.
+
+### Relay Benchmark
+
+Before launching an attack, you can verify which relays are actually usable. The benchmark runs four checks on each selected relay:
+
+| Phase | What it tests |
+|-------|---------------|
+| **Connectivity** | Is the site reachable? Measures base HTTP latency. |
+| **XML-RPC check** | Does `/xmlrpc.php` respond? Are `pingback.ping` and `system.multicall` still available? |
+| **Burst throughput** | Sends N consecutive `system.listMethods` requests (configurable, 1-50) and measures success rate and average response time. |
+| **Grading** | Assigns a letter grade based on all results. |
+
+**Grading system:**
+
+| Grade | Meaning |
+|-------|---------|
+| **A** | Excellent — fast (<500ms avg), reliable (>90% success), both vectors present |
+| **B** | Good — decent speed (<1500ms), mostly reliable (>70% success) |
+| **C** | Usable — slow or with some failures, but vectors are present |
+| **D** | Degraded — XML-RPC active but missing `pingback.ping` or `system.multicall` |
+| **E** | Broken — site is online but XML-RPC is dead |
+| **F** | Offline — site is unreachable |
+
+The output is a summary table showing each relay's grade, latency, XML-RPC status, vector availability, and burst results. Relays graded **E** or **F** are flagged for removal.
 
 ### JSON Database
 

