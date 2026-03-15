@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Botnet Zombies World Map</title>
+    <!-- Leaflet CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            background-color: #0b0f19;
+            color: #00ffcc;
+            font-family: 'Courier New', Courier, monospace;
+        }
+        #header {
+            padding: 15px 20px;
+            background: linear-gradient(90deg, #0b0f19 0%, #151d30 100%);
+            border-bottom: 1px solid #00ffcc;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        h1 {
+            margin: 0;
+            font-size: 1.5rem;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            text-shadow: 0 0 5px #00ffcc;
+        }
+        #stats {
+            background-color: rgba(0, 255, 204, 0.1);
+            border: 1px solid #00ffcc;
+            padding: 5px 15px;
+            border-radius: 4px;
+            font-size: 1.1rem;
+            font-weight: bold;
+        }
+        #map {
+            height: calc(100vh - 61px);
+            width: 100%;
+        }
+        /* Dashboard styling for the popup */
+        .leaflet-popup-content-wrapper {
+            background-color: #151d30;
+            color: #00ffcc;
+            border: 1px solid #00ffcc;
+            border-radius: 4px;
+        }
+        .leaflet-popup-tip {
+            background-color: #151d30;
+            border: 1px solid #00ffcc;
+        }
+        .popup-title {
+            font-weight: bold;
+            font-size: 1.1em;
+            margin-bottom: 5px;
+            border-bottom: 1px dashed #00ffcc;
+            padding-bottom: 3px;
+        }
+        .popup-row {
+            margin: 3px 0;
+            font-size: 0.9em;
+        }
+        .popup-label {
+            color: #88ffeb;
+            font-weight: bold;
+        }
+        a {
+            color: #ff3366;
+            text-decoration: none;
+        }
+        a:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+    <div id="header">
+        <h1>Botnet Zombies World Map</h1>
+        <div id="stats">Active Bots: <span id="bot-count">0</span></div>
+    </div>
+    <div id="map"></div>
+
+    <!-- Leaflet JS -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+    <script>
+        // Init map with dark mode tiles
+        const map = L.map('map').setView([20, 0], 2);
+        
+        L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
+            subdomains: 'abcd',
+            maxZoom: 20
+        }).addTo(map);
+
+        // Custom marker icon style
+        const botIcon = L.divIcon({
+            className: 'custom-div-icon',
+            html: "<div style='background-color:#ff3366;width:10px;height:10px;border-radius:50%;border:1px solid #fff;box-shadow:0 0 10px #ff3366;'></div>",
+            iconSize: [10, 10],
+            iconAnchor: [5, 5]
+        });
+
+        // Fetch data and build map
+        fetch('/api/zombies')
+            .then(r => r.json())
+            .then(data => {
+                let count = 0;
+                data.forEach(bot => {
+                    if (bot.lat && bot.lon) {
+                        count++;
+                        const marker = L.marker([bot.lat, bot.lon], {icon: botIcon}).addTo(map);
+                        
+                        let vectors = bot.vectors ? bot.vectors.join(', ') : 'None';
+                        
+                        let popupHtml = `
+                            <div class="popup-title">${bot.url}</div>
+                            <div class="popup-row"><span class="popup-label">IP:</span> ${bot.ip || 'Unknown'}</div>
+                            <div class="popup-row"><span class="popup-label">CMS:</span> ${bot.cms || 'Unknown'}</div>
+                            <div class="popup-row"><span class="popup-label">Vectors:</span> <span style="color:#ff3366;">${vectors}</span></div>
+                            <div class="popup-row"><span class="popup-label">Country:</span> ${bot.country || 'Unknown'}</div>
+                            <div class="popup-row"><span class="popup-label">City:</span> ${bot.city || 'Unknown'}</div>
+                            <div class="popup-row"><span class="popup-label">Added:</span> ${bot.added ? new Date(bot.added).toLocaleString() : 'Unknown'}</div>
+                            <div class="popup-row" style="margin-top:5px;"><a href="${bot.url}" target="_blank">Visit Site</a></div>
+                        `;
+                        marker.bindPopup(popupHtml);
+                    }
+                });
+                document.getElementById('bot-count').innerText = count;
+            })
+            .catch(err => {
+                console.error("Error fetching zombie data", err);
+                alert("Could not load botnet data. Are they generated yet?");
+            });
+    </script>
+</body>
+</html>
